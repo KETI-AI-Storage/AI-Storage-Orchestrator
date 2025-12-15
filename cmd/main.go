@@ -32,16 +32,25 @@ func main() {
 	migrationController := controller.NewMigrationController(k8sClient)
 	log.Println("Migration controller initialized")
 
+	// Initialize autoscaling controller
+	autoscalingController := controller.NewAutoscalingController(k8sClient)
+	log.Println("Autoscaling controller initialized")
+
 	// Initialize HTTP API handler
-	apiHandler := apis.NewHandler(migrationController)
+	apiHandler := apis.NewHandler(migrationController, autoscalingController)
 	router := apiHandler.SetupRoutes()
-	
+
 	log.Printf("HTTP server starting on port %s", *port)
 	log.Println("Available endpoints:")
 	log.Println("  POST /api/v1/migrations - Start new pod migration")
 	log.Println("  GET  /api/v1/migrations/:id - Get migration details")
 	log.Println("  GET  /api/v1/migrations/:id/status - Get migration status")
-	log.Println("  GET  /api/v1/metrics - Get performance metrics")
+	log.Println("  GET  /api/v1/metrics - Get migration metrics")
+	log.Println("  POST /api/v1/autoscaling - Create autoscaler")
+	log.Println("  GET  /api/v1/autoscaling/:id - Get autoscaler details")
+	log.Println("  DELETE /api/v1/autoscaling/:id - Delete autoscaler")
+	log.Println("  GET  /api/v1/autoscaling - List all autoscalers")
+	log.Println("  GET  /api/v1/autoscaling/metrics - Get autoscaling metrics")
 	log.Println("  GET  /health - Health check")
 
 	// Setup graceful shutdown

@@ -12,13 +12,15 @@ import (
 
 // Handler provides HTTP API endpoints for the migration orchestrator
 type Handler struct {
-	migrationController *controller.MigrationController
+	migrationController   *controller.MigrationController
+	autoscalingController *controller.AutoscalingController
 }
 
 // NewHandler creates a new API handler
-func NewHandler(migrationController *controller.MigrationController) *Handler {
+func NewHandler(migrationController *controller.MigrationController, autoscalingController *controller.AutoscalingController) *Handler {
 	return &Handler{
-		migrationController: migrationController,
+		migrationController:   migrationController,
+		autoscalingController: autoscalingController,
 	}
 }
 
@@ -41,6 +43,13 @@ func (h *Handler) SetupRoutes() *gin.Engine {
 		v1.GET("/migrations/:id", h.getMigration)
 		v1.GET("/migrations/:id/status", h.getMigrationStatus)
 		v1.GET("/metrics", h.getMetrics)
+
+		// Autoscaling API endpoints
+		v1.POST("/autoscaling", h.createAutoscaler)
+		v1.GET("/autoscaling/:id", h.getAutoscaler)
+		v1.DELETE("/autoscaling/:id", h.deleteAutoscaler)
+		v1.GET("/autoscaling", h.listAutoscalers)
+		v1.GET("/autoscaling/metrics", h.getAutoscalingMetrics)
 	}
 
 	return router
@@ -172,6 +181,80 @@ func (h *Handler) validateMigrationRequest(req *types.MigrationRequest) error {
 	}
 	
 	return nil
+}
+
+// createAutoscaler handles POST /api/v1/autoscaling
+func (h *Handler) createAutoscaler(c *gin.Context) {
+	var req types.AutoscalingRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	response, err := h.autoscalingController.CreateAutoscaler(&req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to create autoscaler",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusCreated, response)
+}
+
+// getAutoscaler handles GET /api/v1/autoscaling/:id
+func (h *Handler) getAutoscaler(c *gin.Context) {
+	autoscalerID := c.Param("id")
+
+	response, err := h.autoscalingController.GetAutoscaler(autoscalerID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "Autoscaler not found",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// deleteAutoscaler handles DELETE /api/v1/autoscaling/:id
+func (h *Handler) deleteAutoscaler(c *gin.Context) {
+	autoscalerID := c.Param("id")
+
+	err := h.autoscalingController.DeleteAutoscaler(autoscalerID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "Failed to delete autoscaler",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Autoscaler deleted successfully",
+		"autoscaler_id": autoscalerID,
+	})
+}
+
+// listAutoscalers handles GET /api/v1/autoscaling
+func (h *Handler) listAutoscalers(c *gin.Context) {
+	autoscalers := h.autoscalingController.ListAutoscalers()
+	c.JSON(http.StatusOK, gin.H{
+		"autoscalers": autoscalers,
+		"count":       len(autoscalers),
+	})
+}
+
+// getAutoscalingMetrics handles GET /api/v1/autoscaling/metrics
+func (h *Handler) getAutoscalingMetrics(c *gin.Context) {
+	metrics := h.autoscalingController.GetMetrics()
+	c.JSON(http.StatusOK, metrics)
 }
 
 // corsMiddleware provides CORS support

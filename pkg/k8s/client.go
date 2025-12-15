@@ -247,3 +247,152 @@ func (c *Client) WaitForPodReady(ctx context.Context, namespace, name string, ti
 
 	return fmt.Errorf("timeout waiting for pod to be ready")
 }
+
+// GetWorkloadReplicas gets the current replica count for a workload (Deployment, StatefulSet, ReplicaSet)
+func (c *Client) GetWorkloadReplicas(ctx context.Context, namespace, name, workloadType string) (int32, error) {
+	switch workloadType {
+	case "Deployment":
+		deployment, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return 0, fmt.Errorf("failed to get deployment: %w", err)
+		}
+		return deployment.Status.Replicas, nil
+
+	case "StatefulSet":
+		statefulSet, err := c.clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return 0, fmt.Errorf("failed to get statefulset: %w", err)
+		}
+		return statefulSet.Status.Replicas, nil
+
+	case "ReplicaSet":
+		replicaSet, err := c.clientset.AppsV1().ReplicaSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return 0, fmt.Errorf("failed to get replicaset: %w", err)
+		}
+		return replicaSet.Status.Replicas, nil
+
+	default:
+		return 0, fmt.Errorf("unsupported workload type: %s", workloadType)
+	}
+}
+
+// ScaleWorkload scales a workload to the desired number of replicas
+func (c *Client) ScaleWorkload(ctx context.Context, namespace, name, workloadType string, replicas int32) error {
+	switch workloadType {
+	case "Deployment":
+		deployment, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get deployment: %w", err)
+		}
+		deployment.Spec.Replicas = &replicas
+		_, err = c.clientset.AppsV1().Deployments(namespace).Update(ctx, deployment, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to scale deployment: %w", err)
+		}
+		return nil
+
+	case "StatefulSet":
+		statefulSet, err := c.clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get statefulset: %w", err)
+		}
+		statefulSet.Spec.Replicas = &replicas
+		_, err = c.clientset.AppsV1().StatefulSets(namespace).Update(ctx, statefulSet, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to scale statefulset: %w", err)
+		}
+		return nil
+
+	case "ReplicaSet":
+		replicaSet, err := c.clientset.AppsV1().ReplicaSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get replicaset: %w", err)
+		}
+		replicaSet.Spec.Replicas = &replicas
+		_, err = c.clientset.AppsV1().ReplicaSets(namespace).Update(ctx, replicaSet, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to scale replicaset: %w", err)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unsupported workload type: %s", workloadType)
+	}
+}
+
+// GetWorkloadPodMetrics gets the average CPU, Memory, and GPU utilization for all pods in a workload
+func (c *Client) GetWorkloadPodMetrics(ctx context.Context, namespace, workloadName string) (cpuPercent, memoryPercent, gpuPercent int32, err error) {
+	// List pods with label selector matching the workload
+	pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", workloadName),
+	})
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to list pods: %w", err)
+	}
+
+	if len(pods.Items) == 0 {
+		return 0, 0, 0, fmt.Errorf("no pods found for workload %s", workloadName)
+	}
+
+	var totalCPUPercent, totalMemoryPercent, totalGPUPercent int64
+	podCount := int64(0)
+
+	for _, pod := range pods.Items {
+		// Skip pods that are not running
+		if pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+
+		// Get pod metrics
+		podMetrics, err := c.metricsClientset.MetricsV1beta1().PodMetricses(namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+		if err != nil {
+			// If metrics not available for this pod, skip it
+			continue
+		}
+
+		// Calculate resource usage for this pod
+		var podCPUMillis, podMemoryBytes int64
+		var podCPURequests, podMemoryRequests int64
+
+		for _, container := range podMetrics.Containers {
+			podCPUMillis += container.Usage.Cpu().MilliValue()
+			podMemoryBytes += container.Usage.Memory().Value()
+		}
+
+		// Get resource requests from pod spec
+		for _, container := range pod.Spec.Containers {
+			if cpuReq := container.Resources.Requests.Cpu(); cpuReq != nil {
+				podCPURequests += cpuReq.MilliValue()
+			}
+			if memReq := container.Resources.Requests.Memory(); memReq != nil {
+				podMemoryRequests += memReq.Value()
+			}
+		}
+
+		// Calculate percentage (usage / requests * 100)
+		if podCPURequests > 0 {
+			totalCPUPercent += (podCPUMillis * 100) / podCPURequests
+		}
+		if podMemoryRequests > 0 {
+			totalMemoryPercent += (podMemoryBytes * 100) / podMemoryRequests
+		}
+
+		// GPU metrics would need custom metrics from device plugins
+		// For now, return 0 for GPU
+		totalGPUPercent += 0
+
+		podCount++
+	}
+
+	if podCount == 0 {
+		return 0, 0, 0, fmt.Errorf("no running pods with metrics found for workload %s", workloadName)
+	}
+
+	// Calculate average
+	avgCPU := int32(totalCPUPercent / podCount)
+	avgMemory := int32(totalMemoryPercent / podCount)
+	avgGPU := int32(totalGPUPercent / podCount)
+
+	return avgCPU, avgMemory, avgGPU, nil
+}
