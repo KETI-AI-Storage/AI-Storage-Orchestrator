@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"ai-storage-orchestrator/pkg/k8s"
 	"ai-storage-orchestrator/pkg/types"
 
 	"github.com/google/uuid"
@@ -15,7 +14,7 @@ import (
 
 // AutoscalingController manages autoscaling for workloads
 type AutoscalingController struct {
-	k8sClient      *k8s.Client
+	k8sClient      K8sClientInterface
 	autoscalers    map[string]*AutoscalingJob
 	autoscalersMux sync.RWMutex
 	metrics        *types.AutoscalingMetrics
@@ -30,10 +29,20 @@ type AutoscalingJob struct {
 	CreatedAt   time.Time
 	ctx         context.Context
 	cancel      context.CancelFunc
+
+	// Stabilization tracking
+	scaleUpHistory   []scaleRecommendation
+	scaleDownHistory []scaleRecommendation
+}
+
+// scaleRecommendation represents a scaling recommendation with timestamp
+type scaleRecommendation struct {
+	replicas  int32
+	timestamp time.Time
 }
 
 // NewAutoscalingController creates a new autoscaling controller
-func NewAutoscalingController(k8sClient *k8s.Client) *AutoscalingController {
+func NewAutoscalingController(k8sClient K8sClientInterface) *AutoscalingController {
 	return &AutoscalingController{
 		k8sClient:   k8sClient,
 		autoscalers: make(map[string]*AutoscalingJob),
@@ -73,8 +82,10 @@ func (ac *AutoscalingController) CreateAutoscaler(req *types.AutoscalingRequest)
 			ScaleUpCount:    0,
 			ScaleDownCount:  0,
 		},
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:              ctx,
+		cancel:           cancel,
+		scaleUpHistory:   make([]scaleRecommendation, 0),
+		scaleDownHistory: make([]scaleRecommendation, 0),
 	}
 
 	// Store autoscaler job
@@ -182,28 +193,35 @@ func (ac *AutoscalingController) runAutoscaler(job *AutoscalingJob) {
 			// Decide if scaling is needed
 			desiredReplicas := ac.calculateDesiredReplicas(job, cpuUtil, memUtil, gpuUtil)
 
-			if desiredReplicas != currentReplicas {
-				if err := ac.scaleWorkload(job, desiredReplicas); err != nil {
+			// Apply stabilization window to prevent flapping
+			stabilizedReplicas := ac.applyStabilizationWindow(job, currentReplicas, desiredReplicas)
+
+			if stabilizedReplicas != currentReplicas {
+				if err := ac.scaleWorkload(job, stabilizedReplicas); err != nil {
 					log.Printf("Autoscaler %s: Failed to scale workload: %v", job.ID, err)
 				} else {
 					ac.autoscalersMux.Lock()
-					job.Details.DesiredReplicas = desiredReplicas
+					job.Details.DesiredReplicas = stabilizedReplicas
 					scaleTime := time.Now()
 					job.Details.LastScaleTime = &scaleTime
 
-					if desiredReplicas > currentReplicas {
+					if stabilizedReplicas > currentReplicas {
 						job.Details.ScaleUpCount++
 						ac.metrics.TotalScaleUps++
-						log.Printf("Autoscaler %s: Scaled UP from %d to %d replicas",
-							job.ID, currentReplicas, desiredReplicas)
+						log.Printf("Autoscaler %s: Scaled UP from %d to %d replicas (desired: %d, stabilized: %d)",
+							job.ID, currentReplicas, stabilizedReplicas, desiredReplicas, stabilizedReplicas)
 					} else {
 						job.Details.ScaleDownCount++
 						ac.metrics.TotalScaleDowns++
-						log.Printf("Autoscaler %s: Scaled DOWN from %d to %d replicas",
-							job.ID, currentReplicas, desiredReplicas)
+						log.Printf("Autoscaler %s: Scaled DOWN from %d to %d replicas (desired: %d, stabilized: %d)",
+							job.ID, currentReplicas, stabilizedReplicas, desiredReplicas, stabilizedReplicas)
 					}
 					ac.autoscalersMux.Unlock()
 				}
+			} else if desiredReplicas != currentReplicas {
+				// Log when stabilization window prevents scaling
+				log.Printf("Autoscaler %s: Scaling from %d to %d replicas delayed by stabilization window",
+					job.ID, currentReplicas, desiredReplicas)
 			}
 		}
 	}
@@ -217,28 +235,33 @@ func (ac *AutoscalingController) calculateDesiredReplicas(job *AutoscalingJob, c
 	}
 
 	var desiredReplicas int32 = currentReplicas
+	recommendations := []int32{}
 
 	// Calculate based on CPU if target is set
 	if job.Request.TargetCPU > 0 && cpuUtil > 0 {
 		cpuDesired := int32(float64(currentReplicas) * float64(cpuUtil) / float64(job.Request.TargetCPU))
-		if cpuDesired > desiredReplicas {
-			desiredReplicas = cpuDesired
-		}
+		recommendations = append(recommendations, cpuDesired)
 	}
 
 	// Calculate based on Memory if target is set
 	if job.Request.TargetMemory > 0 && memUtil > 0 {
 		memDesired := int32(float64(currentReplicas) * float64(memUtil) / float64(job.Request.TargetMemory))
-		if memDesired > desiredReplicas {
-			desiredReplicas = memDesired
-		}
+		recommendations = append(recommendations, memDesired)
 	}
 
 	// Calculate based on GPU if target is set
 	if job.Request.TargetGPU > 0 && gpuUtil > 0 {
 		gpuDesired := int32(float64(currentReplicas) * float64(gpuUtil) / float64(job.Request.TargetGPU))
-		if gpuDesired > desiredReplicas {
-			desiredReplicas = gpuDesired
+		recommendations = append(recommendations, gpuDesired)
+	}
+
+	// Use the maximum recommendation (most conservative for scale-down, most responsive for scale-up)
+	if len(recommendations) > 0 {
+		desiredReplicas = recommendations[0]
+		for _, rec := range recommendations {
+			if rec > desiredReplicas {
+				desiredReplicas = rec
+			}
 		}
 	}
 
@@ -267,6 +290,90 @@ func (ac *AutoscalingController) calculateDesiredReplicas(job *AutoscalingJob, c
 				desiredReplicas = currentReplicas - maxChange
 			}
 		}
+	}
+
+	return desiredReplicas
+}
+
+// applyStabilizationWindow applies stabilization window to prevent flapping
+// Returns the stabilized desired replicas based on the scaling history
+func (ac *AutoscalingController) applyStabilizationWindow(job *AutoscalingJob, currentReplicas, desiredReplicas int32) int32 {
+	now := time.Now()
+
+	// Add current recommendation to history
+	recommendation := scaleRecommendation{
+		replicas:  desiredReplicas,
+		timestamp: now,
+	}
+
+	// Determine if scaling up or down
+	if desiredReplicas > currentReplicas {
+		// Scale up scenario
+		job.scaleUpHistory = append(job.scaleUpHistory, recommendation)
+
+		// Get stabilization window (default to 0 if not set)
+		stabilizationWindow := int32(0)
+		if job.Request.ScaleUpPolicy != nil && job.Request.ScaleUpPolicy.StabilizationWindowSeconds > 0 {
+			stabilizationWindow = job.Request.ScaleUpPolicy.StabilizationWindowSeconds
+		}
+
+		if stabilizationWindow > 0 {
+			// Remove recommendations outside the stabilization window
+			cutoffTime := now.Add(-time.Duration(stabilizationWindow) * time.Second)
+			validRecommendations := []scaleRecommendation{}
+			for _, rec := range job.scaleUpHistory {
+				if rec.timestamp.After(cutoffTime) {
+					validRecommendations = append(validRecommendations, rec)
+				}
+			}
+			job.scaleUpHistory = validRecommendations
+
+			// For scale up, use the maximum recommended value within the window (more aggressive)
+			if len(job.scaleUpHistory) > 0 {
+				maxReplicas := job.scaleUpHistory[0].replicas
+				for _, rec := range job.scaleUpHistory {
+					if rec.replicas > maxReplicas {
+						maxReplicas = rec.replicas
+					}
+				}
+				return maxReplicas
+			}
+		}
+	} else if desiredReplicas < currentReplicas {
+		// Scale down scenario
+		job.scaleDownHistory = append(job.scaleDownHistory, recommendation)
+
+		// Get stabilization window (default to 300 seconds if not set)
+		stabilizationWindow := int32(300) // Default 5 minutes for scale down
+		if job.Request.ScaleDownPolicy != nil && job.Request.ScaleDownPolicy.StabilizationWindowSeconds > 0 {
+			stabilizationWindow = job.Request.ScaleDownPolicy.StabilizationWindowSeconds
+		}
+
+		// Remove recommendations outside the stabilization window
+		cutoffTime := now.Add(-time.Duration(stabilizationWindow) * time.Second)
+		validRecommendations := []scaleRecommendation{}
+		for _, rec := range job.scaleDownHistory {
+			if rec.timestamp.After(cutoffTime) {
+				validRecommendations = append(validRecommendations, rec)
+			}
+		}
+		job.scaleDownHistory = validRecommendations
+
+		// For scale down, use the maximum recommended value within the window (more conservative)
+		// This prevents premature scale down
+		if len(job.scaleDownHistory) > 0 {
+			maxReplicas := job.scaleDownHistory[0].replicas
+			for _, rec := range job.scaleDownHistory {
+				if rec.replicas > maxReplicas {
+					maxReplicas = rec.replicas
+				}
+			}
+			return maxReplicas
+		}
+	} else {
+		// No scaling needed, clear histories
+		job.scaleUpHistory = []scaleRecommendation{}
+		job.scaleDownHistory = []scaleRecommendation{}
 	}
 
 	return desiredReplicas
