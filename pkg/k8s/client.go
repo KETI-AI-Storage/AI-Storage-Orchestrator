@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -327,16 +330,42 @@ func (c *Client) ScaleWorkload(ctx context.Context, namespace, name, workloadTyp
 
 // GetWorkloadPodMetrics gets the average CPU, Memory, and GPU utilization for all pods in a workload
 func (c *Client) GetWorkloadPodMetrics(ctx context.Context, namespace, workloadName string) (cpuPercent, memoryPercent, gpuPercent int32, err error) {
-	// List pods with label selector matching the workload
+	// Get label selector for the workload
+	// Try Deployment first, then StatefulSet, then ReplicaSet
+	var labelSelector string
+
+	// Try to get Deployment
+	deployment, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, workloadName, metav1.GetOptions{})
+	if err == nil {
+		// Convert matchLabels to selector string
+		labelSelector = metav1.FormatLabelSelector(deployment.Spec.Selector)
+	} else {
+		// Try StatefulSet
+		statefulSet, err := c.clientset.AppsV1().StatefulSets(namespace).Get(ctx, workloadName, metav1.GetOptions{})
+		if err == nil {
+			labelSelector = metav1.FormatLabelSelector(statefulSet.Spec.Selector)
+		} else {
+			// Try ReplicaSet
+			replicaSet, err := c.clientset.AppsV1().ReplicaSets(namespace).Get(ctx, workloadName, metav1.GetOptions{})
+			if err == nil {
+				labelSelector = metav1.FormatLabelSelector(replicaSet.Spec.Selector)
+			} else {
+				// Fallback to app=workloadName
+				labelSelector = fmt.Sprintf("app=%s", workloadName)
+			}
+		}
+	}
+
+	// List pods with the determined label selector
 	pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app=%s", workloadName),
+		LabelSelector: labelSelector,
 	})
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("failed to list pods: %w", err)
 	}
 
 	if len(pods.Items) == 0 {
-		return 0, 0, 0, fmt.Errorf("no pods found for workload %s", workloadName)
+		return 0, 0, 0, fmt.Errorf("no pods found for workload %s (selector: %s)", workloadName, labelSelector)
 	}
 
 	var totalCPUPercent, totalMemoryPercent, totalGPUPercent int64
@@ -402,29 +431,25 @@ func (c *Client) GetWorkloadPodMetrics(ctx context.Context, namespace, workloadN
 }
 
 // calculatePodGPUUtilization calculates GPU utilization for a pod
-// Attempts to get real GPU metrics via nvidia-smi, falls back to simulation if unavailable
+// Attempts to get real GPU metrics via DCGM Exporter, falls back to simulation if unavailable
 func (c *Client) calculatePodGPUUtilization(pod *corev1.Pod) int32 {
 	// Check if pod has GPU resources requested
-	var totalGPURequested int64
 	var hasGPU bool
-	var gpuContainer string
 
 	for _, container := range pod.Spec.Containers {
 		// Check for NVIDIA GPU
-		if gpuQuantity, exists := container.Resources.Requests["nvidia.com/gpu"]; exists {
-			totalGPURequested += gpuQuantity.Value()
+		if _, exists := container.Resources.Requests["nvidia.com/gpu"]; exists {
 			hasGPU = true
-			gpuContainer = container.Name
+			break
 		}
 		// Check for AMD GPU
-		if gpuQuantity, exists := container.Resources.Requests["amd.com/gpu"]; exists {
-			totalGPURequested += gpuQuantity.Value()
+		if _, exists := container.Resources.Requests["amd.com/gpu"]; exists {
 			hasGPU = true
-			gpuContainer = container.Name
+			break
 		}
 	}
 
-	if !hasGPU || totalGPURequested == 0 {
+	if !hasGPU {
 		return 0
 	}
 
@@ -433,26 +458,105 @@ func (c *Client) calculatePodGPUUtilization(pod *corev1.Pod) int32 {
 		return 0
 	}
 
-	// Try to get real GPU metrics via nvidia-smi
+	// Try to get real GPU metrics via DCGM Exporter
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	gpuUtil, err := c.getGPUUtilizationViaNvidiaSMI(ctx, pod.Namespace, pod.Name, gpuContainer)
+	gpuUtil, err := c.getGPUUtilizationFromDCGM(ctx, pod.Namespace, pod.Name)
 	if err == nil && gpuUtil >= 0 {
 		return gpuUtil
 	}
 
-	// Fallback: Simulate GPU utilization if nvidia-smi fails
+	// Fallback: Simulate GPU utilization if DCGM metrics unavailable
 	// This happens when:
-	// - Pod doesn't have nvidia-smi installed
-	// - Exec permissions denied
-	// - GPU metrics collection failed
+	// - DCGM Exporter is not deployed
+	// - Pod-level metrics not yet available
+	// - Network issues accessing DCGM service
 	baseUtil := int32(60)
-	variance := int32(time.Now().Unix() % 30)
+	variance := int32(rand.New(rand.NewSource(time.Now().UnixNano())).Int31n(30))
 	return baseUtil + variance
 }
 
+// getGPUUtilizationFromDCGM queries DCGM Exporter for GPU utilization of a specific pod
+func (c *Client) getGPUUtilizationFromDCGM(ctx context.Context, namespace, podName string) (int32, error) {
+	// DCGM Exporter service endpoint
+	dcgmURL := "http://dcgm-exporter.gpu-monitoring.svc.cluster.local:9400/metrics"
+
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "GET", dcgmURL, nil)
+	if err != nil {
+		return -1, fmt.Errorf("failed to create DCGM request: %w", err)
+	}
+
+	// Execute request
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return -1, fmt.Errorf("failed to query DCGM exporter: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return -1, fmt.Errorf("DCGM exporter returned status %d", resp.StatusCode)
+	}
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return -1, fmt.Errorf("failed to read DCGM response: %w", err)
+	}
+
+	// Parse Prometheus metrics for this specific pod
+	// Looking for: DCGM_FI_DEV_GPU_UTIL{namespace="...",pod="..."}
+	lines := strings.Split(string(body), "\n")
+	var totalUtil float64
+	var gpuCount int
+
+	for _, line := range lines {
+		// Skip comments and empty lines
+		if strings.HasPrefix(line, "#") || strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		// Check if this is a GPU utilization metric
+		if !strings.HasPrefix(line, "DCGM_FI_DEV_GPU_UTIL{") {
+			continue
+		}
+
+		// Check if this metric belongs to our pod
+		if !strings.Contains(line, fmt.Sprintf("namespace=\"%s\"", namespace)) {
+			continue
+		}
+		if !strings.Contains(line, fmt.Sprintf("pod=\"%s\"", podName)) {
+			continue
+		}
+
+		// Extract the value (last part after space)
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+
+		value := parts[len(parts)-1]
+		util, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			continue
+		}
+
+		totalUtil += util
+		gpuCount++
+	}
+
+	if gpuCount == 0 {
+		return -1, fmt.Errorf("no GPU metrics found for pod %s/%s", namespace, podName)
+	}
+
+	avgUtil := int32(totalUtil / float64(gpuCount))
+	return avgUtil, nil
+}
+
 // getGPUUtilizationViaNvidiaSMI executes nvidia-smi in the pod to get GPU utilization
+// DEPRECATED: Replaced by getGPUUtilizationFromDCGM for better performance and accuracy
 func (c *Client) getGPUUtilizationViaNvidiaSMI(ctx context.Context, namespace, podName, containerName string) (int32, error) {
 	// nvidia-smi command to get average GPU utilization across all GPUs
 	// Format: GPU utilization percentage only

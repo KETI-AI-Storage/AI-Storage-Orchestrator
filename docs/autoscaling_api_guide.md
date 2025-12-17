@@ -411,9 +411,12 @@ The stabilization window prevents rapid scaling oscillations (flapping):
 
 **Problem:** `current_gpu_percent` is always 0
 
-**Current Status:** GPU metrics use simulated values for pods with GPU requests. Integration with NVIDIA DCGM Exporter or Custom Metrics API is planned for future releases.
+**Solution:** The system now uses NVIDIA DCGM Exporter for real-time GPU metrics collection. Ensure:
+1. DCGM Exporter is deployed in the `gpu-monitoring` namespace
+2. GPU nodes have the label `nvidia.com/gpu=present`
+3. Pods requesting GPU resources are running
 
-**Workaround:** The system detects GPU resource requests and simulates utilization (60-90%) for running pods.
+**Fallback Behavior:** If DCGM Exporter is not available or metrics cannot be retrieved, the system falls back to simulated utilization (60-90%) for pods with GPU requests.
 
 ---
 
@@ -461,12 +464,13 @@ The stabilization window prevents rapid scaling oscillations (flapping):
 
 ## Future Enhancements
 
-- **NVIDIA DCGM Integration**: Real-time GPU metrics from DCGM Exporter
 - **CSD Resource Awareness**: Factor in Computational Storage Device metrics
 - **Predictive Autoscaling**: ML-based workload prediction
 - **Multi-cluster Support**: Autoscaling across multiple clusters
-- **Custom Metrics**: Support for application-specific metrics
+- **Custom Metrics**: Support for application-specific metrics via Prometheus
 - **Webhooks**: Event notifications for scaling actions
+- **GPU Memory Metrics**: Track GPU memory utilization in addition to compute utilization
+- **Multi-GPU Pod Support**: Better handling of pods with multiple GPUs
 
 ---
 
