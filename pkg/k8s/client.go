@@ -1009,6 +1009,7 @@ func (c *Client) queryPrometheus(ctx context.Context, promURL, query string) (fl
 // ============================================================================
 
 // GetPodResourceInfo retrieves resource requests and priority information for a pod
+// Includes Storage I/O metrics for AI/ML workload preemption decisions
 func (c *Client) GetPodResourceInfo(ctx context.Context, namespace, name string) (*types.PodResourceInfo, error) {
 	pod, err := c.clientset.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
@@ -1060,6 +1061,31 @@ func (c *Client) GetPodResourceInfo(ctx context.Context, namespace, name string)
 	info.CPURequest = totalCPU
 	info.MemoryRequest = totalMemory
 	info.GPURequest = totalGPU
+
+	// Get Storage I/O metrics for AI/ML workload preemption
+	// This is critical for storage-aware scheduling decisions
+	storageRead, storageWrite, storageIOPS := c.calculatePodStorageMetrics(ctx, pod)
+	info.StorageReadMBps = storageRead
+	info.StorageWriteMBps = storageWrite
+	info.StorageIOPS = storageIOPS
+
+	// Calculate PVC information
+	var pvcCount int32
+	var totalPVCSize int64
+	for _, vol := range pod.Spec.Volumes {
+		if vol.PersistentVolumeClaim != nil {
+			pvcCount++
+			pvcName := vol.PersistentVolumeClaim.ClaimName
+			pvc, err := c.clientset.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, pvcName, metav1.GetOptions{})
+			if err == nil {
+				if storageSize, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; ok {
+					totalPVCSize += storageSize.Value()
+				}
+			}
+		}
+	}
+	info.PVCCount = pvcCount
+	info.TotalPVCSize = totalPVCSize
 
 	return info, nil
 }

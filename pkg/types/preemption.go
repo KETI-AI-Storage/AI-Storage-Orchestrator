@@ -140,6 +140,11 @@ type ResourceAmount struct {
 	Memory  string `json:"memory,omitempty"`  // e.g., "4Gi"
 	GPU     int32  `json:"gpu,omitempty"`
 	Storage string `json:"storage,omitempty"` // e.g., "10Gi"
+
+	// Storage I/O metrics for AI/ML workloads
+	StorageReadMBps  int64 `json:"storage_read_mbps,omitempty"`  // Read throughput in MB/s
+	StorageWriteMBps int64 `json:"storage_write_mbps,omitempty"` // Write throughput in MB/s
+	StorageIOPS      int64 `json:"storage_iops,omitempty"`       // I/O operations per second
 }
 
 // PreemptionMetrics contains overall preemption metrics
@@ -170,6 +175,14 @@ const (
 
 	// StrategyWeightedScore uses weighted scoring combining priority, age, and resource
 	StrategyWeightedScore PreemptionStrategy = "weighted_score"
+
+	// StrategyStorageIOHeaviest preempts pods with highest storage I/O first
+	// Useful for freeing up storage bandwidth for high-priority AI/ML workloads
+	StrategyStorageIOHeaviest PreemptionStrategy = "storage_io_heaviest"
+
+	// StrategyStorageAwareWeighted uses weighted scoring including storage I/O metrics
+	// Combines priority (30%), age (20%), compute resources (25%), storage I/O (25%)
+	StrategyStorageAwareWeighted PreemptionStrategy = "storage_aware_weighted"
 )
 
 // PodResourceInfo contains pod resource information for preemption decisions
@@ -178,8 +191,15 @@ type PodResourceInfo struct {
 	PodNamespace  string
 	PriorityClass string
 	PriorityValue int32
-	CPURequest    int64  // millicores
-	MemoryRequest int64  // bytes
+	CPURequest    int64 // millicores
+	MemoryRequest int64 // bytes
 	GPURequest    int32
 	CreationTime  time.Time
+
+	// Storage I/O metrics for AI/ML data-intensive workloads
+	StorageReadMBps  int64 // Current read throughput in MB/s
+	StorageWriteMBps int64 // Current write throughput in MB/s
+	StorageIOPS      int64 // Current I/O operations per second
+	PVCCount         int32 // Number of PVCs attached
+	TotalPVCSize     int64 // Total PVC size in bytes
 }

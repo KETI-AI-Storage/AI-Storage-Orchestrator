@@ -115,7 +115,7 @@ func (pc *PreemptionController) validateRequest(req *types.PreemptionRequest) er
 		return fmt.Errorf("resource_type is required")
 	}
 
-	validResourceTypes := []string{"cpu", "memory", "gpu", "storage", "all"}
+	validResourceTypes := []string{"cpu", "memory", "gpu", "storage", "storage_iops", "all"}
 	isValidResource := false
 	for _, rt := range validResourceTypes {
 		if req.ResourceType == rt {
@@ -138,6 +138,8 @@ func (pc *PreemptionController) validateRequest(req *types.PreemptionRequest) er
 			string(types.StrategyYoungest),
 			string(types.StrategyLargestResource),
 			string(types.StrategyWeightedScore),
+			string(types.StrategyStorageIOHeaviest),
+			string(types.StrategyStorageAwareWeighted),
 		}
 		isValidStrategy := false
 		for _, s := range validStrategies {
@@ -351,14 +353,17 @@ func (pc *PreemptionController) findPreemptionCandidates(job *PreemptionJob, nod
 			PriorityClass: podInfo.PriorityClass,
 			PriorityValue: podInfo.PriorityValue,
 			ResourceRequests: types.ResourceAmount{
-				CPU:    formatMillicores(podInfo.CPURequest),
-				Memory: formatBytes(podInfo.MemoryRequest),
-				GPU:    podInfo.GPURequest,
+				CPU:              formatMillicores(podInfo.CPURequest),
+				Memory:           formatBytes(podInfo.MemoryRequest),
+				GPU:              podInfo.GPURequest,
+				StorageReadMBps:  podInfo.StorageReadMBps,
+				StorageWriteMBps: podInfo.StorageWriteMBps,
+				StorageIOPS:      podInfo.StorageIOPS,
 			},
 			CreationTime:     podInfo.CreationTime,
 			Age:              ageStr,
 			PreemptionScore:  score,
-			PreemptionReason: fmt.Sprintf("Priority %d < MinPriority %d", podInfo.PriorityValue, job.Request.MinPriority),
+			PreemptionReason: pc.generatePreemptionReason(job.Request.Strategy, podInfo, job.Request.MinPriority),
 			Selected:         false,
 		}
 
@@ -371,6 +376,40 @@ func (pc *PreemptionController) findPreemptionCandidates(job *PreemptionJob, nod
 	})
 
 	return candidates, nil
+}
+
+// generatePreemptionReason generates a human-readable reason for preemption based on strategy
+func (pc *PreemptionController) generatePreemptionReason(strategy string, podInfo *types.PodResourceInfo, minPriority int32) string {
+	switch types.PreemptionStrategy(strategy) {
+	case types.StrategyLowestPriority:
+		return fmt.Sprintf("Priority %d < MinPriority %d", podInfo.PriorityValue, minPriority)
+
+	case types.StrategyYoungest:
+		age := time.Since(podInfo.CreationTime)
+		return fmt.Sprintf("Young pod (age: %s), Priority %d < %d", formatDuration(age), podInfo.PriorityValue, minPriority)
+
+	case types.StrategyLargestResource:
+		return fmt.Sprintf("Large resource consumer (CPU: %s, Mem: %s), Priority %d < %d",
+			formatMillicores(podInfo.CPURequest), formatBytes(podInfo.MemoryRequest),
+			podInfo.PriorityValue, minPriority)
+
+	case types.StrategyWeightedScore:
+		return fmt.Sprintf("Weighted score selection, Priority %d < %d", podInfo.PriorityValue, minPriority)
+
+	case types.StrategyStorageIOHeaviest:
+		return fmt.Sprintf("High storage I/O (Read: %dMB/s, Write: %dMB/s, IOPS: %d), Priority %d < %d",
+			podInfo.StorageReadMBps, podInfo.StorageWriteMBps, podInfo.StorageIOPS,
+			podInfo.PriorityValue, minPriority)
+
+	case types.StrategyStorageAwareWeighted:
+		return fmt.Sprintf("Storage-aware weighted (I/O: %dMB/s, CPU: %s, GPU: %d), Priority %d < %d",
+			podInfo.StorageReadMBps+podInfo.StorageWriteMBps,
+			formatMillicores(podInfo.CPURequest), podInfo.GPURequest,
+			podInfo.PriorityValue, minPriority)
+
+	default:
+		return fmt.Sprintf("Priority %d < MinPriority %d", podInfo.PriorityValue, minPriority)
+	}
 }
 
 // calculatePreemptionScore calculates a score for pod preemption (lower = preempt first)
@@ -398,6 +437,44 @@ func (pc *PreemptionController) calculatePreemptionScore(strategy string, podInf
 
 		// Lower combined score = preempt first
 		return 0.4*priorityScore + 0.3*(-ageScore) + 0.3*(-resourceScore)
+
+	case types.StrategyStorageIOHeaviest:
+		// Higher storage I/O = lower score = preempt first
+		// This is useful when storage bandwidth is the bottleneck
+		// Total I/O throughput in MB/s (read + write) + IOPS normalized
+		totalThroughput := float64(podInfo.StorageReadMBps + podInfo.StorageWriteMBps)
+		iopsNormalized := float64(podInfo.StorageIOPS) / 100.0 // normalize IOPS (divide by 100)
+
+		// Negate to make higher I/O = lower score = preempt first
+		return -(totalThroughput + iopsNormalized)
+
+	case types.StrategyStorageAwareWeighted:
+		// Combined score including storage I/O:
+		// Priority (30%), Age (20%), Compute resources (25%), Storage I/O (25%)
+		//
+		// This strategy is designed for AI/ML workloads where both compute
+		// and storage I/O are important factors for preemption decisions
+
+		// Priority score (lower priority = lower score)
+		priorityScore := float64(podInfo.PriorityValue) / 1000.0
+
+		// Age score (younger = lower score, minimize work loss)
+		ageScore := time.Since(podInfo.CreationTime).Hours() / 24.0
+
+		// Compute resource score (larger = lower score)
+		cpuNorm := float64(podInfo.CPURequest) / 4000.0      // normalize: 4 cores = 1.0
+		memNorm := float64(podInfo.MemoryRequest) / 8e9      // normalize: 8GB = 1.0
+		gpuNorm := float64(podInfo.GPURequest) / 2.0         // normalize: 2 GPUs = 1.0
+		computeScore := cpuNorm + memNorm + gpuNorm*2.0      // GPU weighted more
+
+		// Storage I/O score (higher I/O = lower score)
+		readNorm := float64(podInfo.StorageReadMBps) / 500.0   // normalize: 500 MB/s = 1.0
+		writeNorm := float64(podInfo.StorageWriteMBps) / 200.0 // normalize: 200 MB/s = 1.0
+		iopsNorm := float64(podInfo.StorageIOPS) / 5000.0      // normalize: 5000 IOPS = 1.0
+		storageScore := readNorm + writeNorm + iopsNorm
+
+		// Combined weighted score (lower = preempt first)
+		return 0.30*priorityScore + 0.20*(-ageScore) + 0.25*(-computeScore) + 0.25*(-storageScore)
 
 	default:
 		return float64(podInfo.PriorityValue)
@@ -430,6 +507,12 @@ func (pc *PreemptionController) selectPodsToPreempt(job *PreemptionJob, candidat
 			accumulatedAmount += pc.parseMemory(candidate.ResourceRequests.Memory)
 		case "gpu":
 			accumulatedAmount += int64(candidate.ResourceRequests.GPU)
+		case "storage":
+			// For storage, accumulate total I/O throughput (read + write MB/s)
+			accumulatedAmount += candidate.ResourceRequests.StorageReadMBps + candidate.ResourceRequests.StorageWriteMBps
+		case "storage_iops":
+			// For storage IOPS specifically
+			accumulatedAmount += candidate.ResourceRequests.StorageIOPS
 		case "all":
 			// For "all", we just count pods
 			accumulatedAmount++
@@ -449,6 +532,9 @@ func (pc *PreemptionController) executePreemption(job *PreemptionJob, selectedPo
 	totalCPUFreed := int64(0)
 	totalMemoryFreed := int64(0)
 	totalGPUFreed := int32(0)
+	totalStorageReadFreed := int64(0)
+	totalStorageWriteFreed := int64(0)
+	totalStorageIOPSFreed := int64(0)
 
 	for _, pod := range selectedPods {
 		preemptedAt := time.Now()
@@ -475,12 +561,21 @@ func (pc *PreemptionController) executePreemption(job *PreemptionJob, selectedPo
 			pc.jobsMux.Unlock()
 		} else {
 			result.Status = "success"
-			log.Printf("Successfully evicted pod %s/%s", pod.PodNamespace, pod.PodName)
+			log.Printf("Successfully evicted pod %s/%s (Storage I/O freed: Read=%dMB/s, Write=%dMB/s, IOPS=%d)",
+				pod.PodNamespace, pod.PodName,
+				pod.ResourceRequests.StorageReadMBps,
+				pod.ResourceRequests.StorageWriteMBps,
+				pod.ResourceRequests.StorageIOPS)
 
 			// Accumulate freed resources
 			totalCPUFreed += pc.parseCPU(pod.ResourceRequests.CPU)
 			totalMemoryFreed += pc.parseMemory(pod.ResourceRequests.Memory)
 			totalGPUFreed += pod.ResourceRequests.GPU
+
+			// Accumulate freed storage I/O
+			totalStorageReadFreed += pod.ResourceRequests.StorageReadMBps
+			totalStorageWriteFreed += pod.ResourceRequests.StorageWriteMBps
+			totalStorageIOPSFreed += pod.ResourceRequests.StorageIOPS
 
 			pc.jobsMux.Lock()
 			job.Details.SuccessfulPreemptions++
@@ -492,18 +587,27 @@ func (pc *PreemptionController) executePreemption(job *PreemptionJob, selectedPo
 		results = append(results, result)
 	}
 
-	// Update freed resources
+	// Update freed resources including Storage I/O
 	pc.jobsMux.Lock()
 	job.Details.PreemptedPods = results
 	job.Details.ResourceFreed = types.ResourceAmount{
-		CPU:    formatMillicores(totalCPUFreed),
-		Memory: formatBytes(totalMemoryFreed),
-		GPU:    totalGPUFreed,
+		CPU:              formatMillicores(totalCPUFreed),
+		Memory:           formatBytes(totalMemoryFreed),
+		GPU:              totalGPUFreed,
+		StorageReadMBps:  totalStorageReadFreed,
+		StorageWriteMBps: totalStorageWriteFreed,
+		StorageIOPS:      totalStorageIOPSFreed,
 	}
 
 	// Update global metrics
 	pc.updateGlobalMetrics(totalCPUFreed, totalMemoryFreed, totalGPUFreed)
 	pc.jobsMux.Unlock()
+
+	// Log storage I/O summary
+	if totalStorageReadFreed > 0 || totalStorageWriteFreed > 0 || totalStorageIOPSFreed > 0 {
+		log.Printf("Preemption job %s: Total Storage I/O freed - Read: %dMB/s, Write: %dMB/s, IOPS: %d",
+			job.ID, totalStorageReadFreed, totalStorageWriteFreed, totalStorageIOPSFreed)
+	}
 
 	return nil
 }
@@ -520,6 +624,11 @@ func (pc *PreemptionController) checkTargetAchieved(job *PreemptionJob) bool {
 		freedAmount = pc.parseMemory(job.Details.ResourceFreed.Memory)
 	case "gpu":
 		freedAmount = int64(job.Details.ResourceFreed.GPU)
+	case "storage":
+		// Total I/O throughput (read + write MB/s)
+		freedAmount = job.Details.ResourceFreed.StorageReadMBps + job.Details.ResourceFreed.StorageWriteMBps
+	case "storage_iops":
+		freedAmount = job.Details.ResourceFreed.StorageIOPS
 	case "all":
 		freedAmount = int64(job.Details.SuccessfulPreemptions)
 	}
