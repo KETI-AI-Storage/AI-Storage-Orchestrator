@@ -22,13 +22,13 @@ type AutoscalingController struct {
 
 // AutoscalingJob represents an active autoscaling configuration
 type AutoscalingJob struct {
-	ID          string
-	Request     *types.AutoscalingRequest
-	Status      types.AutoscalingStatus
-	Details     *types.AutoscalingDetails
-	CreatedAt   time.Time
-	ctx         context.Context
-	cancel      context.CancelFunc
+	ID        string
+	Request   *types.AutoscalingRequest
+	Status    types.AutoscalingStatus
+	Details   *types.AutoscalingDetails
+	CreatedAt time.Time
+	ctx       context.Context
+	cancel    context.CancelFunc
 
 	// Stabilization tracking
 	scaleUpHistory   []scaleRecommendation
@@ -434,8 +434,8 @@ func (ac *AutoscalingController) getResourceUtilization(job *AutoscalingJob) (cp
 		memory = 45 + int32(time.Now().Unix()%35)
 		gpu = 40 + int32(time.Now().Unix()%50)
 		// Simulate storage I/O for AI/ML workload
-		storageRead = 300 + int64(time.Now().Unix()%200)  // 300-500 MB/s
-		storageWrite = 80 + int64(time.Now().Unix()%70)   // 80-150 MB/s
+		storageRead = 300 + int64(time.Now().Unix()%200)   // 300-500 MB/s
+		storageWrite = 80 + int64(time.Now().Unix()%70)    // 80-150 MB/s
 		storageIOPS = 2000 + int64(time.Now().Unix()%2000) // 2000-4000 IOPS
 		return cpu, memory, gpu, storageRead, storageWrite, storageIOPS, nil
 	}

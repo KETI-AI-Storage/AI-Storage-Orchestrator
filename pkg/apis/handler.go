@@ -17,16 +17,18 @@ type Handler struct {
 	loadbalancingController *controller.LoadbalancingController
 	provisioningController  *controller.ProvisioningController
 	preemptionController    *controller.PreemptionController
+	cachingController       *controller.CachingController
 }
 
 // NewHandler creates a new API handler
-func NewHandler(migrationController *controller.MigrationController, autoscalingController *controller.AutoscalingController, loadbalancingController *controller.LoadbalancingController, provisioningController *controller.ProvisioningController, preemptionController *controller.PreemptionController) *Handler {
+func NewHandler(migrationController *controller.MigrationController, autoscalingController *controller.AutoscalingController, loadbalancingController *controller.LoadbalancingController, provisioningController *controller.ProvisioningController, preemptionController *controller.PreemptionController, cachingController *controller.CachingController) *Handler {
 	return &Handler{
 		migrationController:     migrationController,
 		autoscalingController:   autoscalingController,
 		loadbalancingController: loadbalancingController,
 		provisioningController:  provisioningController,
 		preemptionController:    preemptionController,
+		cachingController:       cachingController,
 	}
 }
 
@@ -77,6 +79,17 @@ func (h *Handler) SetupRoutes() *gin.Engine {
 		v1.GET("/preemption/:id", h.getPreemption)
 		v1.GET("/preemption", h.listPreemptions)
 		v1.GET("/preemption/metrics", h.getPreemptionMetrics)
+
+		// Caching API endpoints (글로벌 캐싱)
+		v1.POST("/caching", h.createCache)
+		v1.GET("/caching/:id", h.getCache)
+		v1.DELETE("/caching/:id", h.deleteCache)
+		v1.GET("/caching", h.listCaches)
+		v1.POST("/caching/:id/evict", h.evictCache)
+		v1.POST("/caching/:id/warmup", h.warmupCache)
+		v1.POST("/caching/:id/migrate", h.migrateCache)
+		v1.POST("/caching/policy", h.applyPolicyDecision)
+		v1.GET("/caching/metrics", h.getCachingMetrics)
 	}
 
 	return router
@@ -528,5 +541,186 @@ func (h *Handler) listPreemptions(c *gin.Context) {
 // getPreemptionMetrics handles GET /api/v1/preemption/metrics
 func (h *Handler) getPreemptionMetrics(c *gin.Context) {
 	metrics := h.preemptionController.GetMetrics()
+	c.JSON(http.StatusOK, metrics)
+}
+
+// ========================================
+// Caching API Handlers (글로벌 캐싱)
+// ========================================
+
+// createCache handles POST /api/v1/caching
+func (h *Handler) createCache(c *gin.Context) {
+	var req types.CachingRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	response, err := h.cachingController.CreateCache(&req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to create cache",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusCreated, response)
+}
+
+// getCache handles GET /api/v1/caching/:id
+func (h *Handler) getCache(c *gin.Context) {
+	cacheID := c.Param("id")
+
+	response, err := h.cachingController.GetCache(cacheID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "Cache not found",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// deleteCache handles DELETE /api/v1/caching/:id
+func (h *Handler) deleteCache(c *gin.Context) {
+	cacheID := c.Param("id")
+
+	if err := h.cachingController.DeleteCache(cacheID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to delete cache",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "Cache deleted successfully",
+		"cache_id": cacheID,
+	})
+}
+
+// listCaches handles GET /api/v1/caching
+func (h *Handler) listCaches(c *gin.Context) {
+	caches := h.cachingController.ListCaches()
+	c.JSON(http.StatusOK, gin.H{
+		"caches": caches,
+		"count":  len(caches),
+	})
+}
+
+// evictCache handles POST /api/v1/caching/:id/evict
+func (h *Handler) evictCache(c *gin.Context) {
+	cacheID := c.Param("id")
+
+	if err := h.cachingController.EvictCache(cacheID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to evict cache",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "Cache eviction started",
+		"cache_id": cacheID,
+	})
+}
+
+// warmupCache handles POST /api/v1/caching/:id/warmup
+func (h *Handler) warmupCache(c *gin.Context) {
+	cacheID := c.Param("id")
+
+	var req types.CacheWarmupRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		// Use default warmup if no body provided
+		req = types.CacheWarmupRequest{
+			CacheID: cacheID,
+			Async:   true,
+		}
+	} else {
+		req.CacheID = cacheID
+	}
+
+	if err := h.cachingController.WarmupCache(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to warmup cache",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "Cache warmup started",
+		"cache_id": cacheID,
+		"async":    req.Async,
+	})
+}
+
+// migrateCache handles POST /api/v1/caching/:id/migrate
+func (h *Handler) migrateCache(c *gin.Context) {
+	cacheID := c.Param("id")
+
+	var req types.TierMigrationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+	req.CacheID = cacheID
+
+	if err := h.cachingController.MigrateTier(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to migrate cache tier",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "Cache tier migration started",
+		"cache_id":    cacheID,
+		"target_tier": req.TargetTier,
+	})
+}
+
+// applyPolicyDecision handles POST /api/v1/caching/policy
+// 정책 엔진으로부터 받은 캐싱 결정 적용
+func (h *Handler) applyPolicyDecision(c *gin.Context) {
+	var decision types.CachePolicyDecision
+
+	if err := c.ShouldBindJSON(&decision); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	if err := h.cachingController.ApplyPolicyDecision(&decision); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to apply policy decision",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Policy decision applied successfully",
+		"action":  decision.Action,
+	})
+}
+
+// getCachingMetrics handles GET /api/v1/caching/metrics
+func (h *Handler) getCachingMetrics(c *gin.Context) {
+	metrics := h.cachingController.GetMetrics()
 	c.JSON(http.StatusOK, metrics)
 }

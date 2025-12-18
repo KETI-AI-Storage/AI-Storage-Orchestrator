@@ -149,6 +149,12 @@ func (h *LoadbalancingHandlers) GetLoadbalancingMetrics(c *gin.Context) {
 	c.JSON(http.StatusOK, metrics)
 }
 
+// ErrorResponse represents an error response
+type ErrorResponse struct {
+	Error   string `json:"error"`
+	Message string `json:"message"`
+}
+
 // SuccessResponse represents a successful operation
 type SuccessResponse struct {
 	Success bool   `json:"success"`

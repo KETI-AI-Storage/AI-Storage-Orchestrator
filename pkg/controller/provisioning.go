@@ -14,10 +14,10 @@ import (
 
 // ProvisioningController manages storage provisioning for AI/ML workloads
 type ProvisioningController struct {
-	k8sClient      K8sClientInterface
-	provisionings  map[string]*ProvisioningJob
+	k8sClient        K8sClientInterface
+	provisionings    map[string]*ProvisioningJob
 	provisioningsMux sync.RWMutex
-	metrics        *types.ProvisioningMetrics
+	metrics          *types.ProvisioningMetrics
 
 	// Storage profiles for different performance requirements
 	storageProfiles map[string]types.StorageProfile
@@ -25,13 +25,13 @@ type ProvisioningController struct {
 
 // ProvisioningJob represents an active provisioning job
 type ProvisioningJob struct {
-	ID       string
-	Request  *types.ProvisioningRequest
-	Status   types.ProvisioningStatus
-	Details  *types.ProvisioningDetails
+	ID        string
+	Request   *types.ProvisioningRequest
+	Status    types.ProvisioningStatus
+	Details   *types.ProvisioningDetails
 	CreatedAt time.Time
-	ctx      context.Context
-	cancel   context.CancelFunc
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 // NewProvisioningController creates a new provisioning controller
@@ -121,10 +121,10 @@ func (pc *ProvisioningController) CreateProvisioning(req *types.ProvisioningRequ
 		Request: req,
 		Status:  types.ProvisioningStatusPending,
 		Details: &types.ProvisioningDetails{
-			CreatedAt:    time.Now(),
-			PVCName:      fmt.Sprintf("pvc-%s-%s", req.WorkloadName, provisioningID[:8]),
-			ActualSize:   req.StorageSize,
-			ActualClass:  req.StorageClass,
+			CreatedAt:   time.Now(),
+			PVCName:     fmt.Sprintf("pvc-%s-%s", req.WorkloadName, provisioningID[:8]),
+			ActualSize:  req.StorageSize,
+			ActualClass: req.StorageClass,
 		},
 		CreatedAt: time.Now(),
 		ctx:       ctx,

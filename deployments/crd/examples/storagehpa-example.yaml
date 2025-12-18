@@ -1,0 +1,134 @@
+---
+# StorageHPA 예제 1: 기본 CPU 기반 오토스케일링
+# 일반 웹 애플리케이션용
+apiVersion: apollo.keti.re.kr/v1
+kind: StorageHPA
+metadata:
+  name: web-app-autoscaler
+  namespace: default
+spec:
+  workloadRef:
+    name: my-web-app
+    kind: Deployment
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUPercent: 70
+  targetMemoryPercent: 80
+
+---
+# StorageHPA 예제 2: AI/ML 학습 워크로드용 (Storage I/O 포함)
+# 데이터 로딩이 중요한 AI 학습 작업용
+apiVersion: apollo.keti.re.kr/v1
+kind: StorageHPA
+metadata:
+  name: ml-training-autoscaler
+  namespace: ai-workloads
+spec:
+  workloadRef:
+    name: pytorch-training
+    kind: Deployment
+  minReplicas: 1
+  maxReplicas: 8
+
+  # 컴퓨트 리소스
+  targetCPUPercent: 80
+  targetMemoryPercent: 85
+  targetGPUPercent: 75
+
+  # Storage I/O (AI/ML 핵심!)
+  # - 학습 데이터 로딩 최적화
+  # - 체크포인트 저장 최적화
+  targetStorageReadThroughput: 500     # 500 MB/s
+  targetStorageWriteThroughput: 200    # 200 MB/s
+  targetStorageIOPS: 5000              # 5000 IOPS
+
+  # 스케일링 정책
+  scaleUpPolicy:
+    stabilizationWindowSeconds: 60     # 1분간 관찰 후 스케일 업
+    maxScaleChange: 2                  # 한 번에 최대 2개 추가
+  scaleDownPolicy:
+    stabilizationWindowSeconds: 300    # 5분간 관찰 후 스케일 다운
+    maxScaleChange: 1                  # 한 번에 최대 1개 감소
+
+---
+# StorageHPA 예제 3: 추론(Inference) 서버용
+# 빠른 스케일 업, 느린 스케일 다운
+apiVersion: apollo.keti.re.kr/v1
+kind: StorageHPA
+metadata:
+  name: inference-server-autoscaler
+  namespace: ai-inference
+spec:
+  workloadRef:
+    name: triton-inference
+    kind: Deployment
+  minReplicas: 2
+  maxReplicas: 20
+
+  # GPU 사용률 기반 스케일링
+  targetGPUPercent: 60
+  targetCPUPercent: 70
+
+  # 빠른 스케일 업 (부하 급증 대응)
+  scaleUpPolicy:
+    stabilizationWindowSeconds: 0      # 즉시 스케일 업
+    maxScaleChange: 5                  # 한 번에 5개까지
+
+  # 느린 스케일 다운 (비용 최적화하면서 안정성 유지)
+  scaleDownPolicy:
+    stabilizationWindowSeconds: 600    # 10분 대기
+    maxScaleChange: 1
+
+---
+# StorageHPA 예제 4: StatefulSet용 (데이터베이스, Kafka 등)
+apiVersion: apollo.keti.re.kr/v1
+kind: StorageHPA
+metadata:
+  name: database-autoscaler
+  namespace: data
+spec:
+  workloadRef:
+    name: postgres-cluster
+    kind: StatefulSet
+  minReplicas: 3
+  maxReplicas: 7
+
+  # Storage I/O 중심 스케일링
+  targetStorageIOPS: 10000
+  targetStorageReadThroughput: 300
+  targetStorageWriteThroughput: 200
+
+  # StatefulSet은 더 보수적으로 스케일링
+  scaleUpPolicy:
+    stabilizationWindowSeconds: 120
+    maxScaleChange: 1
+  scaleDownPolicy:
+    stabilizationWindowSeconds: 900    # 15분
+    maxScaleChange: 1
+
+---
+# StorageHPA 예제 5: 대용량 데이터 처리 (ETL/배치)
+apiVersion: apollo.keti.re.kr/v1
+kind: StorageHPA
+metadata:
+  name: etl-batch-autoscaler
+  namespace: data-pipeline
+spec:
+  workloadRef:
+    name: spark-worker
+    kind: Deployment
+  minReplicas: 2
+  maxReplicas: 50
+
+  # 주로 Storage I/O 기반
+  targetStorageReadThroughput: 1000    # 1 GB/s 읽기
+  targetStorageWriteThroughput: 500    # 500 MB/s 쓰기
+  targetCPUPercent: 80
+
+  # 배치 작업은 빠르게 스케일
+  scaleUpPolicy:
+    stabilizationWindowSeconds: 30
+    maxScaleChange: 10
+  scaleDownPolicy:
+    stabilizationWindowSeconds: 180
+    maxScaleChange: 5

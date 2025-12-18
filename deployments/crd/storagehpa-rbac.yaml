@@ -1,0 +1,157 @@
+---
+# StorageHPA Controller를 위한 RBAC 설정
+# CRD 컨트롤러가 필요한 권한들을 정의
+#
+# 사용법:
+#   kubectl apply -f storagehpa-rbac.yaml
+
+# ServiceAccount: 컨트롤러가 사용할 서비스 계정
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: storagehpa-controller
+  namespace: kube-system
+  labels:
+    app: ai-storage-orchestrator
+    component: storagehpa-controller
+
+---
+# ClusterRole: 클러스터 전체에서 필요한 권한
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: storagehpa-controller-role
+  labels:
+    app: ai-storage-orchestrator
+    component: storagehpa-controller
+rules:
+  # StorageHPA CRD 관리 권한
+  - apiGroups:
+      - apollo.keti.re.kr
+    resources:
+      - storagehpas
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+
+  # StorageHPA Status 업데이트 권한
+  - apiGroups:
+      - apollo.keti.re.kr
+    resources:
+      - storagehpas/status
+    verbs:
+      - get
+      - update
+      - patch
+
+  # StorageHPA Finalizers 권한
+  - apiGroups:
+      - apollo.keti.re.kr
+    resources:
+      - storagehpas/finalizers
+    verbs:
+      - update
+
+  # Deployment 조회 및 스케일링 권한
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+
+  # Deployment scale 서브리소스 권한
+  - apiGroups:
+      - apps
+    resources:
+      - deployments/scale
+    verbs:
+      - get
+      - update
+      - patch
+
+  # StatefulSet 조회 및 스케일링 권한
+  - apiGroups:
+      - apps
+    resources:
+      - statefulsets
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+
+  # StatefulSet scale 서브리소스 권한
+  - apiGroups:
+      - apps
+    resources:
+      - statefulsets/scale
+    verbs:
+      - get
+      - update
+      - patch
+
+  # Pod 조회 권한 (메트릭 수집용)
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+
+  # Pod 메트릭 조회 권한
+  - apiGroups:
+      - metrics.k8s.io
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+
+  # Node 메트릭 조회 권한
+  - apiGroups:
+      - metrics.k8s.io
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+
+  # Events 생성 권한 (이벤트 로깅용)
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+
+---
+# ClusterRoleBinding: ServiceAccount에 ClusterRole 바인딩
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: storagehpa-controller-rolebinding
+  labels:
+    app: ai-storage-orchestrator
+    component: storagehpa-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: storagehpa-controller-role
+subjects:
+  - kind: ServiceAccount
+    name: storagehpa-controller
+    namespace: kube-system

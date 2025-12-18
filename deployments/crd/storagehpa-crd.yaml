@@ -1,0 +1,240 @@
+---
+# StorageHPA Custom Resource Definition
+# AI/ML 워크로드를 위한 Storage I/O 기반 오토스케일링
+#
+# 사용법:
+#   kubectl apply -f storagehpa-crd.yaml
+#   kubectl get storagehpa
+#
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: storagehpas.apollo.keti.re.kr
+  annotations:
+    description: "Storage-aware Horizontal Pod Autoscaler for AI/ML workloads"
+spec:
+  group: apollo.keti.re.kr
+  names:
+    kind: StorageHPA
+    listKind: StorageHPAList
+    plural: storagehpas
+    singular: storagehpa
+    shortNames:
+      - shpa
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - workloadRef
+                - minReplicas
+                - maxReplicas
+              properties:
+                # 대상 워크로드 참조
+                workloadRef:
+                  type: object
+                  required:
+                    - name
+                    - kind
+                  properties:
+                    name:
+                      type: string
+                      description: "대상 워크로드 이름"
+                    kind:
+                      type: string
+                      description: "워크로드 종류 (Deployment, StatefulSet)"
+                      enum:
+                        - Deployment
+                        - StatefulSet
+
+                # 스케일링 범위
+                minReplicas:
+                  type: integer
+                  minimum: 1
+                  description: "최소 레플리카 수"
+                maxReplicas:
+                  type: integer
+                  minimum: 1
+                  description: "최대 레플리카 수"
+
+                # 컴퓨트 리소스 타겟
+                targetCPUPercent:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+                  description: "목표 CPU 사용률 (%)"
+                targetMemoryPercent:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+                  description: "목표 메모리 사용률 (%)"
+                targetGPUPercent:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+                  description: "목표 GPU 사용률 (%)"
+
+                # Storage I/O 타겟 (AI/ML 워크로드용)
+                targetStorageReadThroughput:
+                  type: integer
+                  minimum: 1
+                  description: "목표 스토리지 읽기 처리량 (MB/s)"
+                targetStorageWriteThroughput:
+                  type: integer
+                  minimum: 1
+                  description: "목표 스토리지 쓰기 처리량 (MB/s)"
+                targetStorageIOPS:
+                  type: integer
+                  minimum: 1
+                  description: "목표 스토리지 IOPS"
+
+                # 스케일링 정책
+                scaleUpPolicy:
+                  type: object
+                  properties:
+                    stabilizationWindowSeconds:
+                      type: integer
+                      minimum: 0
+                      maximum: 3600
+                      description: "스케일 업 전 안정화 대기 시간 (초)"
+                    maxScaleChange:
+                      type: integer
+                      minimum: 1
+                      description: "한 번에 증가할 최대 레플리카 수"
+                scaleDownPolicy:
+                  type: object
+                  properties:
+                    stabilizationWindowSeconds:
+                      type: integer
+                      minimum: 0
+                      maximum: 3600
+                      default: 300
+                      description: "스케일 다운 전 안정화 대기 시간 (초)"
+                    maxScaleChange:
+                      type: integer
+                      minimum: 1
+                      description: "한 번에 감소할 최대 레플리카 수"
+
+            # 상태 (컨트롤러가 업데이트)
+            status:
+              type: object
+              properties:
+                currentReplicas:
+                  type: integer
+                  description: "현재 레플리카 수"
+                desiredReplicas:
+                  type: integer
+                  description: "목표 레플리카 수"
+
+                # 현재 메트릭
+                currentCPUPercent:
+                  type: integer
+                  description: "현재 CPU 사용률 (%)"
+                currentMemoryPercent:
+                  type: integer
+                  description: "현재 메모리 사용률 (%)"
+                currentGPUPercent:
+                  type: integer
+                  description: "현재 GPU 사용률 (%)"
+                currentStorageReadThroughput:
+                  type: integer
+                  description: "현재 스토리지 읽기 처리량 (MB/s)"
+                currentStorageWriteThroughput:
+                  type: integer
+                  description: "현재 스토리지 쓰기 처리량 (MB/s)"
+                currentStorageIOPS:
+                  type: integer
+                  description: "현재 스토리지 IOPS"
+
+                # 스케일링 이력
+                lastScaleTime:
+                  type: string
+                  format: date-time
+                  description: "마지막 스케일링 시간"
+                scaleUpCount:
+                  type: integer
+                  description: "스케일 업 횟수"
+                scaleDownCount:
+                  type: integer
+                  description: "스케일 다운 횟수"
+
+                # 상태
+                phase:
+                  type: string
+                  enum:
+                    - Active
+                    - Inactive
+                    - Failed
+                  description: "오토스케일러 상태"
+                message:
+                  type: string
+                  description: "상태 메시지"
+                lastUpdated:
+                  type: string
+                  format: date-time
+                  description: "마지막 업데이트 시간"
+
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+
+      # kubectl get storagehpa 시 추가 컬럼 표시
+      additionalPrinterColumns:
+        - name: Workload
+          type: string
+          jsonPath: .spec.workloadRef.name
+        - name: Min
+          type: integer
+          jsonPath: .spec.minReplicas
+        - name: Max
+          type: integer
+          jsonPath: .spec.maxReplicas
+        - name: Current
+          type: integer
+          jsonPath: .status.currentReplicas
+        - name: Desired
+          type: integer
+          jsonPath: .status.desiredReplicas
+        - name: CPU
+          type: string
+          jsonPath: .status.currentCPUPercent
+        - name: StorageRead
+          type: string
+          jsonPath: .status.currentStorageReadThroughput
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+
+      subresources:
+        status: {}
