@@ -16,6 +16,11 @@ type AutoscalingRequest struct {
 	TargetMemory   int32   `json:"target_memory_percent,omitempty"`   // Target memory utilization percentage
 	TargetGPU      int32   `json:"target_gpu_percent,omitempty"`      // Target GPU utilization percentage
 
+	// Storage I/O parameters (AI/ML workload data-intensive scenarios)
+	TargetStorageReadThroughput  int64 `json:"target_storage_read_throughput_mbps,omitempty"`  // Target read throughput in MB/s
+	TargetStorageWriteThroughput int64 `json:"target_storage_write_throughput_mbps,omitempty"` // Target write throughput in MB/s
+	TargetStorageIOPS            int64 `json:"target_storage_iops,omitempty"`                  // Target I/O operations per second
+
 	// Advanced settings
 	ScaleUpPolicy   *ScalingPolicy `json:"scale_up_policy,omitempty"`
 	ScaleDownPolicy *ScalingPolicy `json:"scale_down_policy,omitempty"`
@@ -56,6 +61,11 @@ type AutoscalingDetails struct {
 	CurrentCPU       int32              `json:"current_cpu_percent,omitempty"`
 	CurrentMemory    int32              `json:"current_memory_percent,omitempty"`
 	CurrentGPU       int32              `json:"current_gpu_percent,omitempty"`
+
+	// Current storage I/O metrics
+	CurrentStorageReadThroughput  int64 `json:"current_storage_read_throughput_mbps,omitempty"`
+	CurrentStorageWriteThroughput int64 `json:"current_storage_write_throughput_mbps,omitempty"`
+	CurrentStorageIOPS            int64 `json:"current_storage_iops,omitempty"`
 
 	// Scaling events
 	LastScaleTime    *time.Time         `json:"last_scale_time,omitempty"`

@@ -12,15 +12,21 @@ import (
 
 // Handler provides HTTP API endpoints for the migration orchestrator
 type Handler struct {
-	migrationController   *controller.MigrationController
-	autoscalingController *controller.AutoscalingController
+	migrationController     *controller.MigrationController
+	autoscalingController   *controller.AutoscalingController
+	loadbalancingController *controller.LoadbalancingController
+	provisioningController  *controller.ProvisioningController
+	preemptionController    *controller.PreemptionController
 }
 
 // NewHandler creates a new API handler
-func NewHandler(migrationController *controller.MigrationController, autoscalingController *controller.AutoscalingController) *Handler {
+func NewHandler(migrationController *controller.MigrationController, autoscalingController *controller.AutoscalingController, loadbalancingController *controller.LoadbalancingController, provisioningController *controller.ProvisioningController, preemptionController *controller.PreemptionController) *Handler {
 	return &Handler{
-		migrationController:   migrationController,
-		autoscalingController: autoscalingController,
+		migrationController:     migrationController,
+		autoscalingController:   autoscalingController,
+		loadbalancingController: loadbalancingController,
+		provisioningController:  provisioningController,
+		preemptionController:    preemptionController,
 	}
 }
 
@@ -50,6 +56,27 @@ func (h *Handler) SetupRoutes() *gin.Engine {
 		v1.DELETE("/autoscaling/:id", h.deleteAutoscaler)
 		v1.GET("/autoscaling", h.listAutoscalers)
 		v1.GET("/autoscaling/metrics", h.getAutoscalingMetrics)
+
+		// Loadbalancing API endpoints
+		v1.POST("/loadbalancing", h.createLoadbalancing)
+		v1.GET("/loadbalancing/:id", h.getLoadbalancing)
+		v1.DELETE("/loadbalancing/:id", h.cancelLoadbalancing)
+		v1.GET("/loadbalancing", h.listLoadbalancing)
+		v1.GET("/loadbalancing/metrics", h.getLoadbalancingMetrics)
+
+		// Provisioning API endpoints
+		v1.POST("/provisioning", h.createProvisioning)
+		v1.GET("/provisioning/:id", h.getProvisioning)
+		v1.DELETE("/provisioning/:id", h.deleteProvisioning)
+		v1.GET("/provisioning", h.listProvisioning)
+		v1.GET("/provisioning/recommend/:workload_type", h.getProvisioningRecommendation)
+		v1.GET("/provisioning/metrics", h.getProvisioningMetrics)
+
+		// Preemption API endpoints
+		v1.POST("/preemption", h.createPreemption)
+		v1.GET("/preemption/:id", h.getPreemption)
+		v1.GET("/preemption", h.listPreemptions)
+		v1.GET("/preemption/metrics", h.getPreemptionMetrics)
 	}
 
 	return router
@@ -271,4 +298,235 @@ func corsMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// ============================================================================
+// Loadbalancing Handlers
+// ============================================================================
+
+// createLoadbalancing handles POST /api/v1/loadbalancing
+func (h *Handler) createLoadbalancing(c *gin.Context) {
+	var req types.LoadbalancingRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	jobID, err := h.loadbalancingController.StartLoadbalancing(&req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to start loadbalancing",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Get job details
+	response, err := h.loadbalancingController.GetLoadbalancingJob(jobID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Loadbalancing started but failed to retrieve details",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusCreated, response)
+}
+
+// getLoadbalancing handles GET /api/v1/loadbalancing/:id
+func (h *Handler) getLoadbalancing(c *gin.Context) {
+	jobID := c.Param("id")
+
+	response, err := h.loadbalancingController.GetLoadbalancingJob(jobID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "Loadbalancing job not found",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// cancelLoadbalancing handles DELETE /api/v1/loadbalancing/:id
+func (h *Handler) cancelLoadbalancing(c *gin.Context) {
+	jobID := c.Param("id")
+
+	if err := h.loadbalancingController.CancelLoadbalancing(jobID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to cancel loadbalancing",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Loadbalancing job cancelled successfully",
+		"job_id":  jobID,
+	})
+}
+
+// listLoadbalancing handles GET /api/v1/loadbalancing
+func (h *Handler) listLoadbalancing(c *gin.Context) {
+	jobs := h.loadbalancingController.ListLoadbalancingJobs()
+	c.JSON(http.StatusOK, gin.H{
+		"loadbalancing_jobs": jobs,
+		"count":              len(jobs),
+	})
+}
+
+// getLoadbalancingMetrics handles GET /api/v1/loadbalancing/metrics
+func (h *Handler) getLoadbalancingMetrics(c *gin.Context) {
+	metrics := h.loadbalancingController.GetMetrics()
+	c.JSON(http.StatusOK, metrics)
+}
+// ========================================
+// Provisioning API Handlers
+// ========================================
+
+// createProvisioning handles POST /api/v1/provisioning
+func (h *Handler) createProvisioning(c *gin.Context) {
+	var req types.ProvisioningRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	response, err := h.provisioningController.CreateProvisioning(&req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to create provisioning",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusCreated, response)
+}
+
+// getProvisioning handles GET /api/v1/provisioning/:id
+func (h *Handler) getProvisioning(c *gin.Context) {
+	provisioningID := c.Param("id")
+
+	response, err := h.provisioningController.GetProvisioning(provisioningID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "Provisioning not found",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// deleteProvisioning handles DELETE /api/v1/provisioning/:id
+func (h *Handler) deleteProvisioning(c *gin.Context) {
+	provisioningID := c.Param("id")
+
+	if err := h.provisioningController.DeleteProvisioning(provisioningID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to delete provisioning",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":         "Provisioning deleted successfully",
+		"provisioning_id": provisioningID,
+	})
+}
+
+// listProvisioning handles GET /api/v1/provisioning
+func (h *Handler) listProvisioning(c *gin.Context) {
+	provisionings := h.provisioningController.ListProvisionings()
+	c.JSON(http.StatusOK, gin.H{
+		"provisionings": provisionings,
+		"count":         len(provisionings),
+	})
+}
+
+// getProvisioningRecommendation handles GET /api/v1/provisioning/recommend/:workload_type
+func (h *Handler) getProvisioningRecommendation(c *gin.Context) {
+	workloadType := c.Param("workload_type")
+
+	recommendation := h.provisioningController.GetRecommendation(workloadType)
+	c.JSON(http.StatusOK, recommendation)
+}
+
+// getProvisioningMetrics handles GET /api/v1/provisioning/metrics
+func (h *Handler) getProvisioningMetrics(c *gin.Context) {
+	metrics := h.provisioningController.GetMetrics()
+	c.JSON(http.StatusOK, metrics)
+}
+
+// ========================================
+// Preemption API Handlers
+// ========================================
+
+// createPreemption handles POST /api/v1/preemption
+func (h *Handler) createPreemption(c *gin.Context) {
+	var req types.PreemptionRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	response, err := h.preemptionController.StartPreemption(&req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to start preemption",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusCreated, response)
+}
+
+// getPreemption handles GET /api/v1/preemption/:id
+func (h *Handler) getPreemption(c *gin.Context) {
+	preemptionID := c.Param("id")
+
+	response, err := h.preemptionController.GetPreemption(preemptionID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "Preemption job not found",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// listPreemptions handles GET /api/v1/preemption
+func (h *Handler) listPreemptions(c *gin.Context) {
+	preemptions := h.preemptionController.ListPreemptions()
+	c.JSON(http.StatusOK, gin.H{
+		"preemptions": preemptions,
+		"count":       len(preemptions),
+	})
+}
+
+// getPreemptionMetrics handles GET /api/v1/preemption/metrics
+func (h *Handler) getPreemptionMetrics(c *gin.Context) {
+	metrics := h.preemptionController.GetMetrics()
+	c.JSON(http.StatusOK, metrics)
 }

@@ -173,8 +173,8 @@ func (ac *AutoscalingController) runAutoscaler(job *AutoscalingJob) {
 				continue
 			}
 
-			// Get current resource utilization
-			cpuUtil, memUtil, gpuUtil, err := ac.getResourceUtilization(job)
+			// Get current resource utilization (including storage I/O)
+			cpuUtil, memUtil, gpuUtil, storageRead, storageWrite, storageIOPS, err := ac.getResourceUtilization(job)
 			if err != nil {
 				log.Printf("Autoscaler %s: Failed to get resource utilization: %v", job.ID, err)
 				continue
@@ -186,12 +186,15 @@ func (ac *AutoscalingController) runAutoscaler(job *AutoscalingJob) {
 			job.Details.CurrentCPU = cpuUtil
 			job.Details.CurrentMemory = memUtil
 			job.Details.CurrentGPU = gpuUtil
+			job.Details.CurrentStorageReadThroughput = storageRead
+			job.Details.CurrentStorageWriteThroughput = storageWrite
+			job.Details.CurrentStorageIOPS = storageIOPS
 			now := time.Now()
 			job.Details.UpdatedAt = &now
 			ac.autoscalersMux.Unlock()
 
-			// Decide if scaling is needed
-			desiredReplicas := ac.calculateDesiredReplicas(job, cpuUtil, memUtil, gpuUtil)
+			// Decide if scaling is needed (consider all resources including storage I/O)
+			desiredReplicas := ac.calculateDesiredReplicas(job, cpuUtil, memUtil, gpuUtil, storageRead, storageWrite, storageIOPS)
 
 			// Apply stabilization window to prevent flapping
 			stabilizedReplicas := ac.applyStabilizationWindow(job, currentReplicas, desiredReplicas)
@@ -228,7 +231,8 @@ func (ac *AutoscalingController) runAutoscaler(job *AutoscalingJob) {
 }
 
 // calculateDesiredReplicas calculates the desired number of replicas based on current metrics
-func (ac *AutoscalingController) calculateDesiredReplicas(job *AutoscalingJob, cpuUtil, memUtil, gpuUtil int32) int32 {
+// For AI/ML workloads: considers CPU, Memory, GPU, and Storage I/O (critical for data-intensive training)
+func (ac *AutoscalingController) calculateDesiredReplicas(job *AutoscalingJob, cpuUtil, memUtil, gpuUtil int32, storageRead, storageWrite, storageIOPS int64) int32 {
 	currentReplicas := job.Details.CurrentReplicas
 	if currentReplicas == 0 {
 		currentReplicas = 1
@@ -253,6 +257,26 @@ func (ac *AutoscalingController) calculateDesiredReplicas(job *AutoscalingJob, c
 	if job.Request.TargetGPU > 0 && gpuUtil > 0 {
 		gpuDesired := int32(float64(currentReplicas) * float64(gpuUtil) / float64(job.Request.TargetGPU))
 		recommendations = append(recommendations, gpuDesired)
+	}
+
+	// Calculate based on Storage Read Throughput (CRITICAL for AI/ML data loading)
+	if job.Request.TargetStorageReadThroughput > 0 && storageRead > 0 {
+		storageReadDesired := int32(float64(currentReplicas) * float64(storageRead) / float64(job.Request.TargetStorageReadThroughput))
+		recommendations = append(recommendations, storageReadDesired)
+		log.Printf("Autoscaler %s: Storage Read %d MB/s (target: %d MB/s) -> %d replicas",
+			job.ID, storageRead, job.Request.TargetStorageReadThroughput, storageReadDesired)
+	}
+
+	// Calculate based on Storage Write Throughput (for checkpoint saving)
+	if job.Request.TargetStorageWriteThroughput > 0 && storageWrite > 0 {
+		storageWriteDesired := int32(float64(currentReplicas) * float64(storageWrite) / float64(job.Request.TargetStorageWriteThroughput))
+		recommendations = append(recommendations, storageWriteDesired)
+	}
+
+	// Calculate based on Storage IOPS (for mixed read/write workloads)
+	if job.Request.TargetStorageIOPS > 0 && storageIOPS > 0 {
+		iopsDesired := int32(float64(currentReplicas) * float64(storageIOPS) / float64(job.Request.TargetStorageIOPS))
+		recommendations = append(recommendations, iopsDesired)
 	}
 
 	// Use the maximum recommendation (most conservative for scale-down, most responsive for scale-up)
@@ -395,12 +419,12 @@ func (ac *AutoscalingController) getCurrentReplicas(job *AutoscalingJob) (int32,
 	return replicas, nil
 }
 
-// getResourceUtilization returns current CPU, Memory, and GPU utilization percentages
-func (ac *AutoscalingController) getResourceUtilization(job *AutoscalingJob) (cpu, memory, gpu int32, err error) {
+// getResourceUtilization returns current CPU, Memory, GPU, and Storage I/O metrics
+func (ac *AutoscalingController) getResourceUtilization(job *AutoscalingJob) (cpu, memory, gpu int32, storageRead, storageWrite, storageIOPS int64, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	cpuPercent, memoryPercent, gpuPercent, err := ac.k8sClient.GetWorkloadPodMetrics(ctx,
+	cpuPercent, memoryPercent, gpuPercent, readMBps, writeMBps, iops, err := ac.k8sClient.GetWorkloadPodMetrics(ctx,
 		job.Request.WorkloadNamespace,
 		job.Request.WorkloadName)
 	if err != nil {
@@ -409,10 +433,14 @@ func (ac *AutoscalingController) getResourceUtilization(job *AutoscalingJob) (cp
 		cpu = 50 + int32(time.Now().Unix()%40)
 		memory = 45 + int32(time.Now().Unix()%35)
 		gpu = 40 + int32(time.Now().Unix()%50)
-		return cpu, memory, gpu, nil
+		// Simulate storage I/O for AI/ML workload
+		storageRead = 300 + int64(time.Now().Unix()%200)  // 300-500 MB/s
+		storageWrite = 80 + int64(time.Now().Unix()%70)   // 80-150 MB/s
+		storageIOPS = 2000 + int64(time.Now().Unix()%2000) // 2000-4000 IOPS
+		return cpu, memory, gpu, storageRead, storageWrite, storageIOPS, nil
 	}
 
-	return cpuPercent, memoryPercent, gpuPercent, nil
+	return cpuPercent, memoryPercent, gpuPercent, readMBps, writeMBps, iops, nil
 }
 
 // scaleWorkload scales the workload to the desired number of replicas
@@ -451,8 +479,9 @@ func (ac *AutoscalingController) validateRequest(req *types.AutoscalingRequest) 
 	if req.MaxReplicas < req.MinReplicas {
 		return fmt.Errorf("max_replicas must be greater than or equal to min_replicas")
 	}
-	if req.TargetCPU == 0 && req.TargetMemory == 0 && req.TargetGPU == 0 {
-		return fmt.Errorf("at least one target metric (CPU, Memory, or GPU) must be specified")
+	if req.TargetCPU == 0 && req.TargetMemory == 0 && req.TargetGPU == 0 &&
+		req.TargetStorageReadThroughput == 0 && req.TargetStorageWriteThroughput == 0 && req.TargetStorageIOPS == 0 {
+		return fmt.Errorf("at least one target metric (CPU, Memory, GPU, or Storage I/O) must be specified")
 	}
 	return nil
 }
