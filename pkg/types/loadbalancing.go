@@ -20,6 +20,11 @@ type LoadbalancingRequest struct {
 	MemoryThreshold int32 `json:"memory_threshold,omitempty"` // Percentage (default: 80)
 	GPUThreshold    int32 `json:"gpu_threshold,omitempty"`    // Percentage (default: 80)
 
+	// Storage I/O thresholds for AI/ML workloads
+	StorageReadThreshold  int64 `json:"storage_read_threshold,omitempty"`  // MB/s threshold (default: 500)
+	StorageWriteThreshold int64 `json:"storage_write_threshold,omitempty"` // MB/s threshold (default: 200)
+	StorageIOPSThreshold  int64 `json:"storage_iops_threshold,omitempty"`  // IOPS threshold (default: 5000)
+
 	// MaxMigrationsPerCycle limits how many pods can be migrated in one cycle
 	MaxMigrationsPerCycle int32 `json:"max_migrations_per_cycle,omitempty"` // default: 5
 
@@ -100,6 +105,12 @@ type NodeState struct {
 	MemoryCapacity string `json:"memory_capacity"`
 	GPUCapacity    int32  `json:"gpu_capacity"`
 	Layer          string `json:"layer,omitempty"` // orchestration, compute, storage
+
+	// Storage I/O metrics for AI/ML workloads
+	StorageReadMBps  int64 `json:"storage_read_mbps"`  // Current read throughput in MB/s
+	StorageWriteMBps int64 `json:"storage_write_mbps"` // Current write throughput in MB/s
+	StorageIOPS      int64 `json:"storage_iops"`       // Current I/O operations per second
+	StorageUtilization int32 `json:"storage_utilization"` // Storage utilization percentage (0-100)
 }
 
 // MigrationPlan represents a planned pod migration
@@ -136,6 +147,14 @@ type ResourceImprovement struct {
 	GPUVarianceBefore       float64 `json:"gpu_variance_before"`
 	GPUVarianceAfter        float64 `json:"gpu_variance_after"`
 	BalanceScoreImprovement float64 `json:"balance_score_improvement"` // Percentage improvement
+
+	// Storage I/O variance improvements
+	StorageReadVarianceBefore  float64 `json:"storage_read_variance_before"`
+	StorageReadVarianceAfter   float64 `json:"storage_read_variance_after"`
+	StorageWriteVarianceBefore float64 `json:"storage_write_variance_before"`
+	StorageWriteVarianceAfter  float64 `json:"storage_write_variance_after"`
+	StorageIOPSVarianceBefore  float64 `json:"storage_iops_variance_before"`
+	StorageIOPSVarianceAfter   float64 `json:"storage_iops_variance_after"`
 }
 
 // LoadbalancingMetrics contains overall loadbalancing metrics
@@ -164,4 +183,12 @@ const (
 
 	// StrategyWeighted considers weighted combination of all resources
 	StrategyWeighted LoadbalancingStrategy = "weighted"
+
+	// LBStrategyStorageIOBalanced balances nodes based on Storage I/O metrics
+	// Useful for AI/ML workloads with heavy data loading requirements
+	LBStrategyStorageIOBalanced LoadbalancingStrategy = "storage_io_balanced"
+
+	// LBStrategyStorageAwareWeighted combines compute and storage I/O metrics
+	// Uses weighted scoring: CPU (25%), Memory (25%), GPU (20%), Storage I/O (30%)
+	LBStrategyStorageAwareWeighted LoadbalancingStrategy = "storage_aware_weighted"
 )

@@ -22,6 +22,9 @@ type K8sClientInterface interface {
 	GetNodeGPUUtilization(ctx context.Context, nodeName string) (int32, error)
 	ListPodsOnNode(ctx context.Context, nodeName string) ([]string, error)
 
+	// Storage I/O operations for AI/ML workloads
+	GetNodeStorageMetrics(ctx context.Context, nodeName string) (readMBps, writeMBps, iops int64, utilization int32, err error)
+
 	// Preemption operations
 	GetPodResourceInfo(ctx context.Context, namespace, name string) (*types.PodResourceInfo, error)
 	EvictPod(ctx context.Context, namespace, name string, gracePeriodSeconds int64) error

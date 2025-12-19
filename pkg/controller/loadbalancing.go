@@ -98,6 +98,8 @@ func (lc *LoadbalancingController) validateRequest(req *types.LoadbalancingReque
 		string(types.StrategyLoadSpreading),
 		string(types.StrategyStorageAware),
 		string(types.StrategyWeighted),
+		string(types.LBStrategyStorageIOBalanced),
+		string(types.LBStrategyStorageAwareWeighted),
 	}
 	isValid := false
 	for _, s := range validStrategies {
@@ -122,6 +124,17 @@ func (lc *LoadbalancingController) validateRequest(req *types.LoadbalancingReque
 	}
 	if req.MaxMigrationsPerCycle == 0 {
 		req.MaxMigrationsPerCycle = 5
+	}
+
+	// Set default Storage I/O thresholds for AI/ML workloads
+	if req.StorageReadThreshold == 0 {
+		req.StorageReadThreshold = 500 // 500 MB/s
+	}
+	if req.StorageWriteThreshold == 0 {
+		req.StorageWriteThreshold = 200 // 200 MB/s
+	}
+	if req.StorageIOPSThreshold == 0 {
+		req.StorageIOPSThreshold = 5000 // 5000 IOPS
 	}
 
 	return nil
@@ -325,16 +338,33 @@ func (lc *LoadbalancingController) getNodeState(ctx context.Context, nodeName st
 		}
 	}
 
+	// Get Storage I/O metrics for AI/ML workloads
+	storageReadMBps := int64(0)
+	storageWriteMBps := int64(0)
+	storageIOPS := int64(0)
+	storageUtilization := int32(0)
+	readMBps, writeMBps, iops, util, err := lc.k8sClient.GetNodeStorageMetrics(ctx, nodeName)
+	if err == nil {
+		storageReadMBps = readMBps
+		storageWriteMBps = writeMBps
+		storageIOPS = iops
+		storageUtilization = util
+	}
+
 	return &types.NodeState{
-		NodeName:       nodeName,
-		CPUPercent:     cpuPercent,
-		MemoryPercent:  memoryPercent,
-		GPUPercent:     gpuPercent,
-		PodCount:       podCount,
-		CPUCapacity:    cpuCapacity,
-		MemoryCapacity: memoryCapacity,
-		GPUCapacity:    gpuCapacity,
-		Layer:          layer,
+		NodeName:           nodeName,
+		CPUPercent:         cpuPercent,
+		MemoryPercent:      memoryPercent,
+		GPUPercent:         gpuPercent,
+		PodCount:           podCount,
+		CPUCapacity:        cpuCapacity,
+		MemoryCapacity:     memoryCapacity,
+		GPUCapacity:        gpuCapacity,
+		Layer:              layer,
+		StorageReadMBps:    storageReadMBps,
+		StorageWriteMBps:   storageWriteMBps,
+		StorageIOPS:        storageIOPS,
+		StorageUtilization: storageUtilization,
 	}, nil
 }
 
@@ -351,9 +381,16 @@ func (lc *LoadbalancingController) calculateBalanceScore(state *types.ClusterSta
 	gpuCV := lc.calculateCoefficientOfVariation(state.Nodes, "gpu")
 	podCV := lc.calculateCoefficientOfVariation(state.Nodes, "pod")
 
+	// Calculate Storage I/O coefficient of variation for AI/ML workloads
+	storageReadCV := lc.calculateCoefficientOfVariation(state.Nodes, "storage_read")
+	storageWriteCV := lc.calculateCoefficientOfVariation(state.Nodes, "storage_write")
+	storageIOPSCV := lc.calculateCoefficientOfVariation(state.Nodes, "storage_iops")
+	storageCV := (storageReadCV + storageWriteCV + storageIOPSCV) / 3.0
+
 	// Lower CV means more balanced, convert to 0-100 score
 	// CV of 0 = 100 score, CV of 1 = 0 score
-	avgCV := (cpuCV + memCV + gpuCV + podCV) / 4.0
+	// Weight: CPU (20%), Memory (20%), GPU (15%), Pod (15%), Storage I/O (30%)
+	avgCV := 0.20*cpuCV + 0.20*memCV + 0.15*gpuCV + 0.15*podCV + 0.30*storageCV
 	score := math.Max(0, 100.0*(1.0-avgCV))
 
 	return score
