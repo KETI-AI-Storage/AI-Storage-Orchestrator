@@ -414,6 +414,14 @@ func (lc *LoadbalancingController) calculateCoefficientOfVariation(nodes []types
 			val = float64(node.GPUPercent)
 		case "pod":
 			val = float64(node.PodCount)
+		case "storage_read":
+			val = float64(node.StorageReadMBps)
+		case "storage_write":
+			val = float64(node.StorageWriteMBps)
+		case "storage_iops":
+			val = float64(node.StorageIOPS)
+		case "storage_util":
+			val = float64(node.StorageUtilization)
 		}
 		values = append(values, val)
 	}
@@ -455,6 +463,10 @@ func (lc *LoadbalancingController) calculateMigrationPlan(job *LoadbalancingJob,
 		return lc.calculateStorageAwarePlan(job, state)
 	case types.StrategyWeighted:
 		return lc.calculateWeightedPlan(job, state)
+	case types.LBStrategyStorageIOBalanced:
+		return lc.calculateStorageIOBalancedPlan(job, state)
+	case types.LBStrategyStorageAwareWeighted:
+		return lc.calculateStorageAwareWeightedPlan(job, state)
 	default:
 		return nil, fmt.Errorf("unsupported strategy: %s", strategy)
 	}
