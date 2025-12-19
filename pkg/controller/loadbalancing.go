@@ -595,6 +595,172 @@ func (lc *LoadbalancingController) calculateWeightedPlan(job *LoadbalancingJob, 
 	return lc.calculateLoadSpreadingPlan(job, state)
 }
 
+// calculateStorageIOBalancedPlan balances nodes based on Storage I/O metrics
+// This strategy is designed for AI/ML workloads with heavy data loading requirements
+func (lc *LoadbalancingController) calculateStorageIOBalancedPlan(job *LoadbalancingJob, state *types.ClusterState) ([]types.MigrationPlan, error) {
+	ctx := context.Background()
+	plan := make([]types.MigrationPlan, 0)
+
+	// Sort nodes by total Storage I/O (highest first)
+	sortedNodes := make([]types.NodeState, len(state.Nodes))
+	copy(sortedNodes, state.Nodes)
+	sort.Slice(sortedNodes, func(i, j int) bool {
+		ioI := sortedNodes[i].StorageReadMBps + sortedNodes[i].StorageWriteMBps
+		ioJ := sortedNodes[j].StorageReadMBps + sortedNodes[j].StorageWriteMBps
+		return ioI > ioJ
+	})
+
+	// Identify nodes with high and low Storage I/O
+	highIONodes := make([]types.NodeState, 0)
+	lowIONodes := make([]types.NodeState, 0)
+
+	for _, node := range sortedNodes {
+		totalIO := node.StorageReadMBps + node.StorageWriteMBps
+		if node.StorageReadMBps > job.Request.StorageReadThreshold ||
+			node.StorageWriteMBps > job.Request.StorageWriteThreshold ||
+			node.StorageIOPS > job.Request.StorageIOPSThreshold {
+			highIONodes = append(highIONodes, node)
+		} else if totalIO < (job.Request.StorageReadThreshold+job.Request.StorageWriteThreshold)/2 {
+			lowIONodes = append(lowIONodes, node)
+		}
+	}
+
+	if len(highIONodes) == 0 || len(lowIONodes) == 0 {
+		log.Printf("Loadbalancing: Storage I/O is already balanced")
+		return plan, nil
+	}
+
+	// Migrate pods from high I/O nodes to low I/O nodes
+	migrationsCount := 0
+	for _, sourceNode := range highIONodes {
+		if migrationsCount >= int(job.Request.MaxMigrationsPerCycle) {
+			break
+		}
+
+		pods, err := lc.k8sClient.ListPodsOnNode(ctx, sourceNode.NodeName)
+		if err != nil {
+			log.Printf("Warning: Failed to list pods on node %s: %v", sourceNode.NodeName, err)
+			continue
+		}
+
+		for _, podName := range pods {
+			if migrationsCount >= int(job.Request.MaxMigrationsPerCycle) {
+				break
+			}
+
+			// Find target node with lowest I/O
+			targetNode := lowIONodes[0].NodeName
+
+			plan = append(plan, types.MigrationPlan{
+				PodName:      podName,
+				PodNamespace: job.Request.Namespace,
+				SourceNode:   sourceNode.NodeName,
+				TargetNode:   targetNode,
+				Reason: fmt.Sprintf("High Storage I/O on source (Read: %dMB/s, Write: %dMB/s, IOPS: %d)",
+					sourceNode.StorageReadMBps, sourceNode.StorageWriteMBps, sourceNode.StorageIOPS),
+				Priority: int32(100 - migrationsCount),
+			})
+
+			migrationsCount++
+		}
+	}
+
+	return plan, nil
+}
+
+// calculateStorageAwareWeightedPlan combines compute and storage I/O metrics
+// Uses weighted scoring: CPU (25%), Memory (25%), GPU (20%), Storage I/O (30%)
+func (lc *LoadbalancingController) calculateStorageAwareWeightedPlan(job *LoadbalancingJob, state *types.ClusterState) ([]types.MigrationPlan, error) {
+	ctx := context.Background()
+	plan := make([]types.MigrationPlan, 0)
+
+	// Calculate weighted load score for each node
+	type nodeScore struct {
+		node  types.NodeState
+		score float64
+	}
+	scoredNodes := make([]nodeScore, 0, len(state.Nodes))
+
+	for _, node := range state.Nodes {
+		// Normalize metrics (0-1 scale)
+		cpuNorm := float64(node.CPUPercent) / 100.0
+		memNorm := float64(node.MemoryPercent) / 100.0
+		gpuNorm := float64(node.GPUPercent) / 100.0
+
+		// Normalize Storage I/O based on thresholds
+		readNorm := float64(node.StorageReadMBps) / float64(job.Request.StorageReadThreshold)
+		writeNorm := float64(node.StorageWriteMBps) / float64(job.Request.StorageWriteThreshold)
+		iopsNorm := float64(node.StorageIOPS) / float64(job.Request.StorageIOPSThreshold)
+		storageNorm := (readNorm + writeNorm + iopsNorm) / 3.0
+
+		// Weighted score: CPU (25%), Memory (25%), GPU (20%), Storage I/O (30%)
+		score := 0.25*cpuNorm + 0.25*memNorm + 0.20*gpuNorm + 0.30*storageNorm
+
+		scoredNodes = append(scoredNodes, nodeScore{node: node, score: score})
+	}
+
+	// Sort by score (highest first = most loaded)
+	sort.Slice(scoredNodes, func(i, j int) bool {
+		return scoredNodes[i].score > scoredNodes[j].score
+	})
+
+	// Identify overloaded and underloaded nodes (threshold: score > 0.8 or < 0.4)
+	overloadedNodes := make([]nodeScore, 0)
+	underloadedNodes := make([]nodeScore, 0)
+
+	for _, ns := range scoredNodes {
+		if ns.score > 0.8 {
+			overloadedNodes = append(overloadedNodes, ns)
+		} else if ns.score < 0.4 {
+			underloadedNodes = append(underloadedNodes, ns)
+		}
+	}
+
+	if len(overloadedNodes) == 0 || len(underloadedNodes) == 0 {
+		log.Printf("Loadbalancing: Cluster is balanced (weighted score)")
+		return plan, nil
+	}
+
+	// Migrate pods from overloaded to underloaded nodes
+	migrationsCount := 0
+	for _, source := range overloadedNodes {
+		if migrationsCount >= int(job.Request.MaxMigrationsPerCycle) {
+			break
+		}
+
+		pods, err := lc.k8sClient.ListPodsOnNode(ctx, source.node.NodeName)
+		if err != nil {
+			log.Printf("Warning: Failed to list pods on node %s: %v", source.node.NodeName, err)
+			continue
+		}
+
+		for _, podName := range pods {
+			if migrationsCount >= int(job.Request.MaxMigrationsPerCycle) {
+				break
+			}
+
+			// Target: lowest scored node
+			target := underloadedNodes[0]
+
+			plan = append(plan, types.MigrationPlan{
+				PodName:      podName,
+				PodNamespace: job.Request.Namespace,
+				SourceNode:   source.node.NodeName,
+				TargetNode:   target.node.NodeName,
+				Reason: fmt.Sprintf("Weighted score %.2f > 0.8 (CPU: %d%%, Mem: %d%%, GPU: %d%%, Storage I/O: %dMB/s)",
+					source.score, source.node.CPUPercent, source.node.MemoryPercent,
+					source.node.GPUPercent, source.node.StorageReadMBps+source.node.StorageWriteMBps),
+				Priority:             int32(100 - migrationsCount),
+				EstimatedImprovement: source.score - target.score,
+			})
+
+			migrationsCount++
+		}
+	}
+
+	return plan, nil
+}
+
 // executeMigrations executes the migration plan
 func (lc *LoadbalancingController) executeMigrations(job *LoadbalancingJob, plan []types.MigrationPlan) error {
 	results := make([]types.MigrationResult, 0)
@@ -684,6 +850,14 @@ func (lc *LoadbalancingController) calculateImprovement(before, after *types.Clu
 		GPUVarianceBefore:       lc.calculateCoefficientOfVariation(before.Nodes, "gpu"),
 		GPUVarianceAfter:        lc.calculateCoefficientOfVariation(after.Nodes, "gpu"),
 		BalanceScoreImprovement: after.BalanceScore - before.BalanceScore,
+
+		// Storage I/O variance improvements
+		StorageReadVarianceBefore:  lc.calculateCoefficientOfVariation(before.Nodes, "storage_read"),
+		StorageReadVarianceAfter:   lc.calculateCoefficientOfVariation(after.Nodes, "storage_read"),
+		StorageWriteVarianceBefore: lc.calculateCoefficientOfVariation(before.Nodes, "storage_write"),
+		StorageWriteVarianceAfter:  lc.calculateCoefficientOfVariation(after.Nodes, "storage_write"),
+		StorageIOPSVarianceBefore:  lc.calculateCoefficientOfVariation(before.Nodes, "storage_iops"),
+		StorageIOPSVarianceAfter:   lc.calculateCoefficientOfVariation(after.Nodes, "storage_iops"),
 	}
 }
 
