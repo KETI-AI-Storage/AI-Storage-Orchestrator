@@ -27,9 +27,6 @@ type PreemptionRequest struct {
 	// MaxPodsToPreempt limits the number of pods to preempt
 	MaxPodsToPreempt int32 `json:"max_pods_to_preempt,omitempty"` // default: 10
 
-	// DryRun mode only calculates recommendations without executing preemption
-	DryRun bool `json:"dry_run,omitempty"`
-
 	// GracePeriodSeconds for pod termination
 	GracePeriodSeconds int64 `json:"grace_period_seconds,omitempty"` // default: 30
 

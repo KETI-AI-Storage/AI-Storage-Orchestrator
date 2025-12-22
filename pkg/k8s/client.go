@@ -949,7 +949,7 @@ func (c *Client) getSimulatedStorageMetrics(nodeName string) (readMBps, writeMBp
 }
 
 // ListPodsOnNode returns a list of pod names running on a specific node
-func (c *Client) ListPodsOnNode(ctx context.Context, nodeName string) ([]string, error) {
+func (c *Client) ListPodsOnNode(ctx context.Context, nodeName string) ([]types.PodRef, error) {
 	fieldSelector := fields.OneTermEqualSelector("spec.nodeName", nodeName).String()
 	podList, err := c.clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		FieldSelector: fieldSelector,
@@ -958,15 +958,18 @@ func (c *Client) ListPodsOnNode(ctx context.Context, nodeName string) ([]string,
 		return nil, fmt.Errorf("failed to list pods on node: %w", err)
 	}
 
-	podNames := make([]string, 0)
+	pods := make([]types.PodRef, 0)
 	for _, pod := range podList.Items {
 		// Only include running pods
 		if pod.Status.Phase == corev1.PodRunning {
-			podNames = append(podNames, pod.Name)
+			pods = append(pods, types.PodRef{
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+			})
 		}
 	}
 
-	return podNames, nil
+	return pods, nil
 }
 
 // calculatePodStorageMetrics calculates storage I/O metrics for a pod

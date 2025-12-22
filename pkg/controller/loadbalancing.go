@@ -150,12 +150,32 @@ func (lc *LoadbalancingController) runLoadbalancing(job *LoadbalancingJob) {
 		lc.jobsMux.Unlock()
 	}()
 
-	// For periodic loadbalancing
+	// One-time execution (interval == 0)
+	if job.Request.Interval == 0 {
+		if err := lc.executeCycle(job); err != nil {
+			log.Printf("Loadbalancing job %s failed: %v", job.ID, err)
+			lc.jobsMux.Lock()
+			job.Status = types.LoadbalancingStatusFailed
+			job.Details.ErrorMessage = err.Error()
+			completedAt := time.Now()
+			job.Details.CompletedAt = &completedAt
+			lc.jobsMux.Unlock()
+			return
+		}
+		lc.jobsMux.Lock()
+		job.Status = types.LoadbalancingStatusCompleted
+		completedAt := time.Now()
+		job.Details.CompletedAt = &completedAt
+		lc.jobsMux.Unlock()
+		log.Printf("Loadbalancing job %s completed", job.ID)
+		return
+	}
+
+	// Periodic execution (interval > 0)
 	ticker := time.NewTicker(time.Duration(job.Request.Interval) * time.Second)
 	defer ticker.Stop()
 
 	for {
-		// Execute one loadbalancing cycle
 		if err := lc.executeCycle(job); err != nil {
 			log.Printf("Loadbalancing job %s failed: %v", job.ID, err)
 			lc.jobsMux.Lock()
@@ -167,18 +187,6 @@ func (lc *LoadbalancingController) runLoadbalancing(job *LoadbalancingJob) {
 			return
 		}
 
-		// If not periodic, exit after one cycle
-		if job.Request.Interval == 0 {
-			lc.jobsMux.Lock()
-			job.Status = types.LoadbalancingStatusCompleted
-			completedAt := time.Now()
-			job.Details.CompletedAt = &completedAt
-			lc.jobsMux.Unlock()
-			log.Printf("Loadbalancing job %s completed", job.ID)
-			return
-		}
-
-		// Wait for next cycle or cancellation
 		select {
 		case <-job.ctx.Done():
 			lc.jobsMux.Lock()
@@ -224,12 +232,6 @@ func (lc *LoadbalancingController) executeCycle(job *LoadbalancingJob) error {
 	// If no migrations needed, return success
 	if len(migrationPlan) == 0 {
 		log.Printf("Loadbalancing job %s: Cluster is already balanced", job.ID)
-		return nil
-	}
-
-	// If dry-run mode, don't execute migrations
-	if job.Request.DryRun {
-		log.Printf("Loadbalancing job %s: Dry-run mode, %d migrations planned", job.ID, len(migrationPlan))
 		return nil
 	}
 
@@ -518,19 +520,16 @@ func (lc *LoadbalancingController) calculateLoadSpreadingPlan(job *Loadbalancing
 			continue
 		}
 
-		// Filter pods based on namespace
-		filteredPods := make([]string, 0)
-		for _, podName := range pods {
-			namespace := job.Request.Namespace
-			if namespace == "" {
-				namespace = "default"
+		// Filter pods based on namespace (if specified)
+		filteredPods := make([]types.PodRef, 0)
+		for _, pod := range pods {
+			if job.Request.Namespace == "" || pod.Namespace == job.Request.Namespace {
+				filteredPods = append(filteredPods, pod)
 			}
-			// TODO: Get actual pod namespace
-			filteredPods = append(filteredPods, podName)
 		}
 
 		// Try to migrate some pods
-		for _, podName := range filteredPods {
+		for _, pod := range filteredPods {
 			if migrationsCount >= int(job.Request.MaxMigrationsPerCycle) {
 				break
 			}
@@ -539,8 +538,8 @@ func (lc *LoadbalancingController) calculateLoadSpreadingPlan(job *Loadbalancing
 			targetNode := underloadedNodes[0].NodeName
 
 			plan = append(plan, types.MigrationPlan{
-				PodName:      podName,
-				PodNamespace: job.Request.Namespace,
+				PodName:      pod.Name,
+				PodNamespace: pod.Namespace,
 				SourceNode:   sourceNode.NodeName,
 				TargetNode:   targetNode,
 				Reason:       fmt.Sprintf("Source node overloaded (%.1f%%), target node underloaded", float64(sourceNode.CPUPercent+sourceNode.MemoryPercent)/2.0),
@@ -643,17 +642,22 @@ func (lc *LoadbalancingController) calculateStorageIOBalancedPlan(job *Loadbalan
 			continue
 		}
 
-		for _, podName := range pods {
+		for _, pod := range pods {
 			if migrationsCount >= int(job.Request.MaxMigrationsPerCycle) {
 				break
+			}
+
+			// Skip if namespace filter specified and doesn't match
+			if job.Request.Namespace != "" && pod.Namespace != job.Request.Namespace {
+				continue
 			}
 
 			// Find target node with lowest I/O
 			targetNode := lowIONodes[0].NodeName
 
 			plan = append(plan, types.MigrationPlan{
-				PodName:      podName,
-				PodNamespace: job.Request.Namespace,
+				PodName:      pod.Name,
+				PodNamespace: pod.Namespace,
 				SourceNode:   sourceNode.NodeName,
 				TargetNode:   targetNode,
 				Reason: fmt.Sprintf("High Storage I/O on source (Read: %dMB/s, Write: %dMB/s, IOPS: %d)",
@@ -734,17 +738,22 @@ func (lc *LoadbalancingController) calculateStorageAwareWeightedPlan(job *Loadba
 			continue
 		}
 
-		for _, podName := range pods {
+		for _, pod := range pods {
 			if migrationsCount >= int(job.Request.MaxMigrationsPerCycle) {
 				break
+			}
+
+			// Skip if namespace filter specified and doesn't match
+			if job.Request.Namespace != "" && pod.Namespace != job.Request.Namespace {
+				continue
 			}
 
 			// Target: lowest scored node
 			target := underloadedNodes[0]
 
 			plan = append(plan, types.MigrationPlan{
-				PodName:      podName,
-				PodNamespace: job.Request.Namespace,
+				PodName:      pod.Name,
+				PodNamespace: pod.Namespace,
 				SourceNode:   source.node.NodeName,
 				TargetNode:   target.node.NodeName,
 				Reason: fmt.Sprintf("Weighted score %.2f > 0.8 (CPU: %d%%, Mem: %d%%, GPU: %d%%, Storage I/O: %dMB/s)",

@@ -20,7 +20,7 @@ type K8sClientInterface interface {
 	GetNodePodCount(ctx context.Context, nodeName string) (int32, error)
 	GetNodeLabel(ctx context.Context, nodeName string, labelKey string) (string, error)
 	GetNodeGPUUtilization(ctx context.Context, nodeName string) (int32, error)
-	ListPodsOnNode(ctx context.Context, nodeName string) ([]string, error)
+	ListPodsOnNode(ctx context.Context, nodeName string) ([]types.PodRef, error)
 
 	// Storage I/O operations for AI/ML workloads
 	GetNodeStorageMetrics(ctx context.Context, nodeName string) (readMBps, writeMBps, iops int64, utilization int32, err error)

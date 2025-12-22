@@ -225,17 +225,6 @@ func (pc *PreemptionController) runPreemption(job *PreemptionJob) {
 	job.Details.PodsToPreempt = int32(len(selectedPods))
 	pc.jobsMux.Unlock()
 
-	// If dry-run mode, don't execute preemption
-	if job.Request.DryRun {
-		log.Printf("Preemption job %s: Dry-run mode, %d pods would be preempted", job.ID, len(selectedPods))
-		pc.jobsMux.Lock()
-		job.Status = types.PreemptionStatusCompleted
-		completedAt := time.Now()
-		job.Details.CompletedAt = &completedAt
-		pc.jobsMux.Unlock()
-		return
-	}
-
 	// Phase 4: Execute preemption
 	pc.updateJobStatus(job, types.PreemptionStatusExecuting)
 
@@ -314,9 +303,10 @@ func (pc *PreemptionController) findPreemptionCandidates(job *PreemptionJob, nod
 	}
 
 	// Get pod details
-	for _, podFullName := range pods {
-		// Parse pod name and namespace
-		podNamespace, podName := pc.parsePodFullName(podFullName)
+	for _, pod := range pods {
+		// Use pod namespace and name directly from PodRef
+		podNamespace := pod.Namespace
+		podName := pod.Name
 
 		// Skip protected namespaces
 		if pc.isProtectedNamespace(podNamespace, job.Request.ProtectedNamespaces) {

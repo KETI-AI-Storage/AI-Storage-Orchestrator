@@ -148,7 +148,6 @@ LB_RESPONSE=$(curl -s -X POST http://localhost:$ORCHESTRATOR_PORT/api/v1/loadbal
     "cpu_threshold": 80,
     "memory_threshold": 80,
     "max_migrations_per_cycle": 3,
-    "dry_run": true,
     "interval": 0
   }')
 
@@ -226,7 +225,6 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
         "cpu_threshold": 70,
         "memory_threshold": 70,
         "max_migrations_per_cycle": 2,
-        "dry_run": false,
         "preserve_pv": true,
         "interval": 0
       }')

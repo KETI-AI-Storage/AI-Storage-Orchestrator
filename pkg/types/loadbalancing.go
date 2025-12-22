@@ -28,9 +28,6 @@ type LoadbalancingRequest struct {
 	// MaxMigrationsPerCycle limits how many pods can be migrated in one cycle
 	MaxMigrationsPerCycle int32 `json:"max_migrations_per_cycle,omitempty"` // default: 5
 
-	// DryRun mode only calculates recommendations without executing migrations
-	DryRun bool `json:"dry_run,omitempty"`
-
 	// Interval for periodic loadbalancing (in seconds, 0 means one-time)
 	Interval int32 `json:"interval,omitempty"`
 

@@ -66,7 +66,6 @@ test_dryrun_cpu_preemption() {
             "strategy": "lowest_priority",
             "min_priority": 0,
             "max_pods_to_preempt": 5,
-            "dry_run": true,
             "reason": "Test dry-run CPU preemption"
         }')
 
@@ -122,7 +121,6 @@ test_dryrun_memory_preemption() {
             "strategy": "largest_resource",
             "min_priority": 100,
             "max_pods_to_preempt": 3,
-            "dry_run": true,
             "reason": "Test dry-run memory preemption"
         }')
 
@@ -166,7 +164,6 @@ test_youngest_strategy() {
             "strategy": "youngest",
             "min_priority": 0,
             "max_pods_to_preempt": 2,
-            "dry_run": true,
             "reason": "Test youngest strategy"
         }')
 
@@ -197,7 +194,6 @@ test_weighted_score_strategy() {
             "target_amount": "2",
             "strategy": "weighted_score",
             "min_priority": 0,
-            "dry_run": true,
             "reason": "Test weighted_score strategy"
         }')
 
@@ -326,7 +322,6 @@ test_namespace_filtering() {
             "resource_type": "cpu",
             "target_amount": "500m",
             "strategy": "lowest_priority",
-            "dry_run": true,
             "reason": "Test namespace filtering"
         }')
 
@@ -356,7 +351,6 @@ test_protected_namespaces() {
             "resource_type": "cpu",
             "target_amount": "500m",
             "protected_namespaces": ["kube-system", "monitoring", "production"],
-            "dry_run": true,
             "reason": "Test protected namespaces"
         }')
 

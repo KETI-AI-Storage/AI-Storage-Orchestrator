@@ -1,0 +1,167 @@
+# Loadbalancing 테스트용 Pod 정의
+# 각 노드에 분산 배치하여 로드밸런싱 테스트 수행
+
+---
+# Pod 1: CPU 집약 워크로드
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-test-pod-01-cpu
+  namespace: default
+  labels:
+    app: lb-test
+    type: cpu-intensive
+spec:
+  containers:
+  - name: stress-cpu
+    image: polinux/stress
+    command: ["stress"]
+    args: ["--cpu", "2", "--timeout", "3600s"]
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "256Mi"
+      limits:
+        cpu: "1000m"
+        memory: "512Mi"
+
+---
+# Pod 2: Memory 집약 워크로드
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-test-pod-02-memory
+  namespace: default
+  labels:
+    app: lb-test
+    type: memory-intensive
+spec:
+  containers:
+  - name: stress-mem
+    image: polinux/stress
+    command: ["stress"]
+    args: ["--vm", "1", "--vm-bytes", "256M", "--timeout", "3600s"]
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "200m"
+        memory: "512Mi"
+
+---
+# Pod 3: I/O 집약 워크로드 (Read)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-test-pod-03-io-read
+  namespace: default
+  labels:
+    app: lb-test
+    type: io-read-intensive
+spec:
+  containers:
+  - name: fio-read
+    image: ljishen/fio
+    command: ["fio"]
+    args:
+    - "--name=readtest"
+    - "--rw=read"
+    - "--bs=4k"
+    - "--size=100M"
+    - "--numjobs=2"
+    - "--time_based"
+    - "--runtime=3600"
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+
+---
+# Pod 4: I/O 집약 워크로드 (Write)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-test-pod-04-io-write
+  namespace: default
+  labels:
+    app: lb-test
+    type: io-write-intensive
+spec:
+  containers:
+  - name: fio-write
+    image: ljishen/fio
+    command: ["fio"]
+    args:
+    - "--name=writetest"
+    - "--rw=write"
+    - "--bs=4k"
+    - "--size=100M"
+    - "--numjobs=2"
+    - "--time_based"
+    - "--runtime=3600"
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+
+---
+# Pod 5: Mixed 워크로드 (CPU + Memory)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-test-pod-05-mixed
+  namespace: default
+  labels:
+    app: lb-test
+    type: mixed
+spec:
+  containers:
+  - name: stress-mixed
+    image: polinux/stress
+    command: ["stress"]
+    args: ["--cpu", "1", "--vm", "1", "--vm-bytes", "128M", "--timeout", "3600s"]
+    resources:
+      requests:
+        cpu: "300m"
+        memory: "256Mi"
+      limits:
+        cpu: "600m"
+        memory: "512Mi"
+
+---
+# Pod 6: AI 학습 시뮬레이션 (High I/O + GPU placeholder)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lb-test-pod-06-ai-training
+  namespace: default
+  labels:
+    app: lb-test
+    type: ai-training
+spec:
+  containers:
+  - name: ai-sim
+    image: ljishen/fio
+    command: ["fio"]
+    args:
+    - "--name=ai-data-load"
+    - "--rw=randread"
+    - "--bs=1M"
+    - "--size=500M"
+    - "--numjobs=4"
+    - "--time_based"
+    - "--runtime=3600"
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"

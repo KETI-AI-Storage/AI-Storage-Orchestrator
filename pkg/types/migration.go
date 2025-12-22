@@ -2,6 +2,12 @@ package types
 
 import "time"
 
+// PodRef represents a reference to a pod with namespace
+type PodRef struct {
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
 // MigrationRequest represents a pod migration request
 type MigrationRequest struct {
 	// Source pod information
