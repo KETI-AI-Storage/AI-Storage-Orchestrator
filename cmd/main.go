@@ -51,8 +51,12 @@ func main() {
 	cachingController := controller.NewCachingController(k8sClient)
 	log.Println("Caching controller initialized")
 
+	// Initialize insight controller (워크로드 시그니처 수집)
+	insightController := controller.NewInsightController()
+	log.Println("Insight controller initialized")
+
 	// Initialize HTTP API handler
-	apiHandler := apis.NewHandler(migrationController, autoscalingController, loadbalancingController, provisioningController, preemptionController, cachingController)
+	apiHandler := apis.NewHandler(migrationController, autoscalingController, loadbalancingController, provisioningController, preemptionController, cachingController, insightController)
 	router := apiHandler.SetupRoutes()
 
 	log.Printf("HTTP server starting on port %s", port)
@@ -90,6 +94,10 @@ func main() {
 	log.Println("  POST   /api/v1/caching/:id/migrate - Migrate cache tier")
 	log.Println("  POST   /api/v1/caching/policy - Apply policy decision")
 	log.Println("  GET    /api/v1/caching/metrics - Get caching metrics")
+	log.Println("  POST   /api/v1/insight/report - Receive workload signature report")
+	log.Println("  GET    /api/v1/insight/signatures - List all workload signatures")
+	log.Println("  GET    /api/v1/insight/signatures/:namespace/:name - Get specific signature")
+	log.Println("  GET    /api/v1/insight/metrics - Get insight metrics")
 	log.Println("  GET    /health - Health check")
 
 	// Setup graceful shutdown

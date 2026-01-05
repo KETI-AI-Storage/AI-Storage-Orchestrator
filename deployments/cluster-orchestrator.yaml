@@ -68,8 +68,9 @@ spec:
         layer: orchestration
     spec:
       serviceAccountName: ai-storage-orchestrator
+      # Control Plane에 배치
       nodeSelector:
-        layer: orchestration
+        node-role.kubernetes.io/control-plane: ""
       tolerations:
       - key: node-role.kubernetes.io/control-plane
         operator: Exists

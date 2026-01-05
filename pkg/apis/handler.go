@@ -18,10 +18,11 @@ type Handler struct {
 	provisioningController  *controller.ProvisioningController
 	preemptionController    *controller.PreemptionController
 	cachingController       *controller.CachingController
+	insightController       *controller.InsightController
 }
 
 // NewHandler creates a new API handler
-func NewHandler(migrationController *controller.MigrationController, autoscalingController *controller.AutoscalingController, loadbalancingController *controller.LoadbalancingController, provisioningController *controller.ProvisioningController, preemptionController *controller.PreemptionController, cachingController *controller.CachingController) *Handler {
+func NewHandler(migrationController *controller.MigrationController, autoscalingController *controller.AutoscalingController, loadbalancingController *controller.LoadbalancingController, provisioningController *controller.ProvisioningController, preemptionController *controller.PreemptionController, cachingController *controller.CachingController, insightController *controller.InsightController) *Handler {
 	return &Handler{
 		migrationController:     migrationController,
 		autoscalingController:   autoscalingController,
@@ -29,6 +30,7 @@ func NewHandler(migrationController *controller.MigrationController, autoscaling
 		provisioningController:  provisioningController,
 		preemptionController:    preemptionController,
 		cachingController:       cachingController,
+		insightController:       insightController,
 	}
 }
 
@@ -90,6 +92,12 @@ func (h *Handler) SetupRoutes() *gin.Engine {
 		v1.POST("/caching/:id/migrate", h.migrateCache)
 		v1.POST("/caching/policy", h.applyPolicyDecision)
 		v1.GET("/caching/metrics", h.getCachingMetrics)
+
+		// Insight API endpoints (워크로드 시그니처 수집)
+		v1.POST("/insight/report", h.receiveInsightReport)
+		v1.GET("/insight/signatures", h.listInsightSignatures)
+		v1.GET("/insight/signatures/:namespace/:name", h.getInsightSignature)
+		v1.GET("/insight/metrics", h.getInsightMetrics)
 	}
 
 	return router
@@ -722,5 +730,66 @@ func (h *Handler) applyPolicyDecision(c *gin.Context) {
 // getCachingMetrics handles GET /api/v1/caching/metrics
 func (h *Handler) getCachingMetrics(c *gin.Context) {
 	metrics := h.cachingController.GetMetrics()
+	c.JSON(http.StatusOK, metrics)
+}
+
+// ========================================
+// Insight API Handlers (워크로드 시그니처)
+// ========================================
+
+// receiveInsightReport handles POST /api/v1/insight/report
+// Receives workload signature reports from insight-trace sidecars
+func (h *Handler) receiveInsightReport(c *gin.Context) {
+	var report types.InsightReport
+
+	if err := c.ShouldBindJSON(&report); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Invalid request format",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	response, err := h.insightController.ReceiveReport(&report)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "Failed to process insight report",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// listInsightSignatures handles GET /api/v1/insight/signatures
+func (h *Handler) listInsightSignatures(c *gin.Context) {
+	signatures := h.insightController.ListSignatures()
+	c.JSON(http.StatusOK, gin.H{
+		"signatures": signatures,
+		"count":      len(signatures),
+	})
+}
+
+// getInsightSignature handles GET /api/v1/insight/signatures/:namespace/:name
+func (h *Handler) getInsightSignature(c *gin.Context) {
+	namespace := c.Param("namespace")
+	name := c.Param("name")
+
+	signature, err := h.insightController.GetSignature(namespace, name)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "Signature not found",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, signature)
+}
+
+// getInsightMetrics handles GET /api/v1/insight/metrics
+func (h *Handler) getInsightMetrics(c *gin.Context) {
+	metrics := h.insightController.GetMetrics()
 	c.JSON(http.StatusOK, metrics)
 }
