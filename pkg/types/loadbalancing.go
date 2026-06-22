@@ -188,4 +188,10 @@ const (
 	// LBStrategyStorageAwareWeighted combines compute and storage I/O metrics
 	// Uses weighted scoring: CPU (25%), Memory (25%), GPU (20%), Storage I/O (30%)
 	LBStrategyStorageAwareWeighted LoadbalancingStrategy = "storage_aware_weighted"
+
+	// StrategyPodCount 은 노드별 Pod 개수 편차만으로 imbalance 를 판정한다.
+	// WHY: 데모 환경처럼 노드 CPU/Memory 사용률이 모두 낮은 경우 기존 strategy 들은 모두
+	//      "Cluster is already balanced" 로 결정해 migration plan 을 만들지 않는다.
+	//      Pod 분포 편차만으로 migration plan 을 만들어 demo 에서 실제 Pod 이동을 보장한다.
+	StrategyPodCount LoadbalancingStrategy = "pod_count"
 )

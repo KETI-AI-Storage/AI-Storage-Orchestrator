@@ -20,6 +20,9 @@ rules:
 - apiGroups: [""]
   resources: ["pods/eviction"]
   verbs: ["create"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
 - apiGroups: ["apps"]
   resources: ["deployments", "statefulsets", "replicasets"]
   verbs: ["get", "list", "watch", "update", "patch"]
@@ -58,6 +61,9 @@ metadata:
     layer: orchestration
 spec:
   replicas: 1
+  # RollingUpdate 기본 maxSurge 는 replica=1 일 때도 잠시 Pod 2개가 뜰 수 있음 → Recreate 로 단일 Pod 유지.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: ai-storage-orchestrator
@@ -85,6 +91,14 @@ spec:
         env:
         - name: PORT
           value: "8080"
+        - name: MAX_CONCURRENT_MIGRATIONS
+          value: "3"
+        # config.yaml 경로를 명시(ResolvePath 기본값과 동일). ConfigMap 은 아래 volume 으로
+        # /etc/orchestrator 에 마운트된다.
+        - name: ORCHESTRATOR_CONFIG
+          value: "/etc/orchestrator/config.yaml"
+        - name: INSIGHT_HUB_ORCH_RESULT_ENDPOINT
+          value: "http://insight-hub.keti.svc.cluster.local:8081/api/v1/orchestration-results"
         resources:
           requests:
             cpu: 100m
@@ -175,32 +189,20 @@ data:
     logging:
       level: "info"
       format: "json"
+
+    provisioning:
+      # tier(L1/L2/L3/S3) → 실제 클러스터 StorageClass 매핑.
+      # WHY: 클러스터엔 storage-l1/l2/l3/s3 만 존재. 기존엔 이 매핑이 Go 바이너리에
+      #      하드코딩(과거엔 high-throughput)돼 있어 SC 명명이 바뀌면 재빌드가 필요했다.
+      #      여기서 관리하면 ConfigMap 만 수정하고 재시작하면 된다.
+      # default_storage_class: 알 수 없는 tier 가 들어왔을 때의 보정용 SC.
+      default_storage_class: storage-l2
+      tier_storage_classes:
+        L1: storage-l1
+        L2: storage-l2
+        L3: storage-l3
+        S3: storage-s3
 ---
-# Optional: Horizontal Pod Autoscaler for the orchestrator itself
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: ai-storage-orchestrator-hpa
-  namespace: kube-system
-  labels:
-    app: ai-storage-orchestrator
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: ai-storage-orchestrator
-  minReplicas: 1
-  maxReplicas: 3
-  metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 70
-  - type: Resource
-    resource:
-      name: memory
-      target:
-        type: Utilization
-        averageUtilization: 80
+# HPA 는 기본 매니페스트에서 제외함.
+# 클러스터에 남아 있으면 CPU/메모리에 따라 replica 가 2~3으로 늘어 같은 RS 에 Pod 가 둘 뜨는 현상이 난다.
+# 필요 시: kubectl apply -f deployments/cluster-orchestrator-hpa-optional.yaml

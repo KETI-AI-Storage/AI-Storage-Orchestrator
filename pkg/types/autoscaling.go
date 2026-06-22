@@ -7,14 +7,14 @@ type AutoscalingRequest struct {
 	// Target workload information
 	WorkloadName      string `json:"workload_name" binding:"required"`
 	WorkloadNamespace string `json:"workload_namespace" binding:"required"`
-	WorkloadType      string `json:"workload_type" binding:"required"` // Deployment, StatefulSet, etc.
+	WorkloadType      string `json:"workload_type,omitempty"` // auto, Deployment, StatefulSet, ReplicaSet
 
 	// Scaling parameters
-	MinReplicas    int32   `json:"min_replicas" binding:"required"`
-	MaxReplicas    int32   `json:"max_replicas" binding:"required"`
-	TargetCPU      int32   `json:"target_cpu_percent,omitempty"`      // Target CPU utilization percentage
-	TargetMemory   int32   `json:"target_memory_percent,omitempty"`   // Target memory utilization percentage
-	TargetGPU      int32   `json:"target_gpu_percent,omitempty"`      // Target GPU utilization percentage
+	MinReplicas  int32 `json:"min_replicas" binding:"required"`
+	MaxReplicas  int32 `json:"max_replicas" binding:"required"`
+	TargetCPU    int32 `json:"target_cpu_percent,omitempty"`    // Target CPU utilization percentage
+	TargetMemory int32 `json:"target_memory_percent,omitempty"` // Target memory utilization percentage
+	TargetGPU    int32 `json:"target_gpu_percent,omitempty"`    // Target GPU utilization percentage
 
 	// Storage I/O parameters (AI/ML workload data-intensive scenarios)
 	TargetStorageReadThroughput  int64 `json:"target_storage_read_throughput_mbps,omitempty"`  // Target read throughput in MB/s
@@ -28,16 +28,16 @@ type AutoscalingRequest struct {
 
 // ScalingPolicy defines the policy for scaling operations
 type ScalingPolicy struct {
-	StabilizationWindowSeconds int32 `json:"stabilization_window_seconds,omitempty"` // Time to wait before scaling
+	StabilizationWindowSeconds int32  `json:"stabilization_window_seconds,omitempty"` // Time to wait before scaling
 	SelectPolicy               string `json:"select_policy,omitempty"`                // Max, Min, Disabled
 	MaxScaleChange             int32  `json:"max_scale_change,omitempty"`             // Maximum number of replicas to change at once
 }
 
 // AutoscalingResponse represents the response for an autoscaling request
 type AutoscalingResponse struct {
-	AutoscalingID string             `json:"autoscaling_id"`
-	Status        AutoscalingStatus  `json:"status"`
-	Message       string             `json:"message"`
+	AutoscalingID string              `json:"autoscaling_id"`
+	Status        AutoscalingStatus   `json:"status"`
+	Message       string              `json:"message"`
 	Details       *AutoscalingDetails `json:"details,omitempty"`
 }
 
@@ -52,15 +52,15 @@ const (
 
 // AutoscalingDetails contains detailed information about the autoscaling configuration
 type AutoscalingDetails struct {
-	CreatedAt        time.Time          `json:"created_at"`
-	UpdatedAt        *time.Time         `json:"updated_at,omitempty"`
-	CurrentReplicas  int32              `json:"current_replicas"`
-	DesiredReplicas  int32              `json:"desired_replicas"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       *time.Time `json:"updated_at,omitempty"`
+	CurrentReplicas int32      `json:"current_replicas"`
+	DesiredReplicas int32      `json:"desired_replicas"`
 
 	// Current metrics
-	CurrentCPU       int32              `json:"current_cpu_percent,omitempty"`
-	CurrentMemory    int32              `json:"current_memory_percent,omitempty"`
-	CurrentGPU       int32              `json:"current_gpu_percent,omitempty"`
+	CurrentCPU    int32 `json:"current_cpu_percent,omitempty"`
+	CurrentMemory int32 `json:"current_memory_percent,omitempty"`
+	CurrentGPU    int32 `json:"current_gpu_percent,omitempty"`
 
 	// Current storage I/O metrics
 	CurrentStorageReadThroughput  int64 `json:"current_storage_read_throughput_mbps,omitempty"`
@@ -68,12 +68,12 @@ type AutoscalingDetails struct {
 	CurrentStorageIOPS            int64 `json:"current_storage_iops,omitempty"`
 
 	// Scaling events
-	LastScaleTime    *time.Time         `json:"last_scale_time,omitempty"`
-	ScaleUpCount     int64              `json:"scale_up_count"`
-	ScaleDownCount   int64              `json:"scale_down_count"`
+	LastScaleTime  *time.Time `json:"last_scale_time,omitempty"`
+	ScaleUpCount   int64      `json:"scale_up_count"`
+	ScaleDownCount int64      `json:"scale_down_count"`
 
 	// HPA name (if using Kubernetes HPA)
-	HPAName          string             `json:"hpa_name,omitempty"`
+	HPAName string `json:"hpa_name,omitempty"`
 }
 
 // AutoscalingMetrics represents metrics for autoscaling operations

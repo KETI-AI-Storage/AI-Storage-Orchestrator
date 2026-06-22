@@ -3,10 +3,14 @@ package k8s
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -15,10 +19,13 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
@@ -27,9 +34,9 @@ import (
 
 // Client wraps Kubernetes client with migration-specific functionality
 type Client struct {
-	clientset       kubernetes.Interface
+	clientset        kubernetes.Interface
 	metricsClientset metricsclientset.Interface
-	config          *rest.Config
+	config           *rest.Config
 }
 
 // NewClient creates a new Kubernetes client
@@ -42,10 +49,16 @@ func NewClient(kubeconfig string) (*Client, error) {
 	} else {
 		config, err = rest.InClusterConfig()
 	}
-	
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to create kubernetes config: %w", err)
 	}
+
+	// InClusterConfig 등이 QPS=5/Burst=10을 설정하는 경우가 있어,
+	// 다수 Autoscaler 고루틴이 동시에 API를 호출하면 rate limiter Wait가
+	// context deadline과 충돌한다(오케스트레이터 로그에 확인됨).
+	config.QPS = 100
+	config.Burst = 200
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -64,9 +77,30 @@ func NewClient(kubeconfig string) (*Client, error) {
 	}, nil
 }
 
-// GetPod retrieves a pod by name and namespace
+// GetPod retrieves a pod by name and namespace.
+//
+// 호환 목적의 fallback을 포함한다. 기존 migration 코드가 Deployment 이름을
+// target pod name처럼 넘기는 경우가 있었기 때문에, exact Pod 조회가 NotFound이면
+// workload resolver로 실제 Running Pod를 찾는다.
 func (c *Client) GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
-	return c.clientset.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+	pod, err := c.clientset.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err == nil {
+		return pod, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, err
+	}
+
+	// WHY: OrchestrationPolicy.targetWorkload가 Deployment/Job/Workflow 이름일 수 있다.
+	//      migration/preemption 계열은 실제 Pod가 필요하므로 selector 기반으로 해석한다.
+	pods, resolvedKind, resolveErr := c.ResolveTargetPods(ctx, namespace, name, WorkloadTypeAuto, PolicyTypeMigration, "")
+	if resolveErr != nil {
+		return nil, resolveErr
+	}
+	if len(pods) == 0 {
+		return nil, NewWaitingForTargetError(namespace, name, resolvedKind, PolicyTypeMigration, "no running target pod")
+	}
+	return pods[0].DeepCopy(), nil
 }
 
 // GetPodContainerStates analyzes container states in a pod
@@ -75,7 +109,7 @@ func (c *Client) GetPodContainerStates(ctx context.Context, pod *corev1.Pod) ([]
 
 	for _, container := range pod.Spec.Containers {
 		var containerStatus corev1.ContainerStatus
-		
+
 		// Find matching container status
 		for _, status := range pod.Status.ContainerStatuses {
 			if status.Name == container.Name {
@@ -112,21 +146,65 @@ func (c *Client) GetPodContainerStates(ctx context.Context, pod *corev1.Pod) ([]
 	return states, nil
 }
 
-// CreatePersistentVolumeClaim creates a PVC for checkpointing container state
+// checkpointStorageClass 는 마이그레이션 checkpoint PVC 전용 StorageClass 다.
+// WHY: 클러스터 default SC(storage-l2 등)는 volumeBindingMode=WaitForFirstConsumer 라,
+//
+//	checkpoint PVC 가 "Pod 이 써야 바인딩"되는데 migrated Pod 은 "PVC 가 바인딩돼야
+//	시작"되어 상호 대기 데드락이 발생한다(마이그레이션 영구 정지).
+//	Immediate 바인딩 SC 를 써서 Pod 과 무관하게 즉시 PVC 가 Bound 되도록 한다.
+//	(nfs-subdir provisioner 는 Immediate 바인딩 지원.)
+const checkpointStorageClass = "checkpoint-immediate"
+
+// CreatePersistentVolumeClaim creates a PVC for checkpointing container state (migration use)
 func (c *Client) CreatePersistentVolumeClaim(ctx context.Context, namespace, name string, size string) error {
+	return c.CreatePVC(ctx, namespace, name, size, checkpointStorageClass, "ReadWriteOnce", map[string]string{
+		"app":       "ai-storage-orchestrator",
+		"component": "migration-checkpoint",
+	})
+}
+
+// CreatePVC creates a PersistentVolumeClaim with the given parameters.
+// storageClass may be empty (uses cluster default). accessMode defaults to ReadWriteOnce.
+func (c *Client) CreatePVC(ctx context.Context, namespace, name, size, storageClass, accessMode string, labels map[string]string) error {
+	return c.CreatePVCWithAnnotations(ctx, namespace, name, size, storageClass, accessMode, labels, nil)
+}
+
+// CreatePVCWithAnnotations 는 CreatePVC 와 동일하나 annotations 도 함께 박는다.
+//
+// WHY: provisioning 정책은 tier 결정 결과를 PVC annotation
+//
+//	(ai-storage/selected-tier, storage.keti.io/tier-hint) 으로 남겨야 한다.
+//	기존 CreatePVC 시그니처를 그대로 유지하기 위해 별도 헬퍼로 분리.
+func (c *Client) CreatePVCWithAnnotations(ctx context.Context, namespace, name, size, storageClass, accessMode string, labels, annotations map[string]string) error {
+	if accessMode == "" {
+		accessMode = "ReadWriteOnce"
+	}
+	am := corev1.PersistentVolumeAccessMode(accessMode)
+
+	mergedLabels := map[string]string{
+		"app":       "ai-storage-orchestrator",
+		"component": "provisioning",
+	}
+	for k, v := range labels {
+		mergedLabels[k] = v
+	}
+
+	mergedAnnotations := map[string]string{}
+	for k, v := range annotations {
+		if v != "" {
+			mergedAnnotations[k] = v
+		}
+	}
+
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			Labels: map[string]string{
-				"app":       "ai-storage-orchestrator",
-				"component": "migration-checkpoint",
-			},
+			Name:        name,
+			Namespace:   namespace,
+			Labels:      mergedLabels,
+			Annotations: mergedAnnotations,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{
-				corev1.ReadWriteOnce,
-			},
+			AccessModes: []corev1.PersistentVolumeAccessMode{am},
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: resource.MustParse(size),
@@ -135,62 +213,191 @@ func (c *Client) CreatePersistentVolumeClaim(ctx context.Context, namespace, nam
 		},
 	}
 
+	if storageClass != "" {
+		pvc.Spec.StorageClassName = &storageClass
+	}
+
 	_, err := c.clientset.CoreV1().PersistentVolumeClaims(namespace).Create(ctx, pvc, metav1.CreateOptions{})
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to create PVC %s/%s: %w", namespace, name, err)
+	}
+	return nil
+}
+
+// CreateBindingPodForPVC 는 WaitForFirstConsumer 모드 StorageClass 의 PVC 를 즉시
+// Bound 시키기 위해 해당 PVC 를 마운트하는 임시 1-shot Pod 을 띄운다.
+//
+// WHY: ai-storage demo 환경의 storage-{l1,l2,l3,s3} (Gluesys 표준) SC 는 모두
+//
+//	volumeBindingMode=WaitForFirstConsumer 라서 PVC 를 만들기만 해서는 Pending
+//	상태로 남는다. provisioning 정책이 "PVC Bound" 까지를 책임지도록 PVC 직후
+//	binder Pod 을 띄워 binding 을 유도한다. binder Pod 은 종료 후 호출자가 삭제한다.
+func (c *Client) CreateBindingPodForPVC(ctx context.Context, namespace, pvcName, podName string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app":        "ai-storage-orchestrator",
+				"component":  "provisioning-binder",
+				"target-pvc": pvcName,
+			},
+			// WHY: webhook 의 sidecar 주입을 회피해 binder Pod 이 빠르게 Terminate 되도록 한다.
+			Annotations: map[string]string{
+				"keti-ai-storage-injection":            "disabled",
+				"insight-trace.keti.io/main-container": "binder",
+				"mlops.keti.io/main-container":         "binder",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{
+				{
+					Name:    "binder",
+					Image:   "busybox:1.36",
+					Command: []string{"sh", "-c", "ls -la /mnt/target >/dev/null 2>&1; exit 0"},
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: "target", MountPath: "/mnt/target"},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "target",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName,
+						},
+					},
+				},
+			},
+		},
+	}
+	_, err := c.clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create binder pod %s/%s for pvc %s: %w", namespace, podName, pvcName, err)
+	}
+	return nil
+}
+
+// DeletePVC deletes a PersistentVolumeClaim.
+func (c *Client) DeletePVC(ctx context.Context, namespace, name string) error {
+	err := c.clientset.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to delete PVC %s/%s: %w", namespace, name, err)
+	}
+	return nil
+}
+
+// WaitForPVCReady polls until the PVC reaches Bound phase or the timeout expires.
+func (c *Client) WaitForPVCReady(ctx context.Context, namespace, name string, timeoutSeconds int) error {
+	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
+	for time.Now().Before(deadline) {
+		pvc, err := c.clientset.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get PVC %s/%s: %w", namespace, name, err)
+		}
+		if pvc.Status.Phase == corev1.ClaimBound {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+	return fmt.Errorf("PVC %s/%s did not become Bound within %ds", namespace, name, timeoutSeconds)
 }
 
 // DeletePod deletes a pod gracefully
 func (c *Client) DeletePod(ctx context.Context, namespace, name string) error {
 	gracePeriod := int64(30) // 30 seconds grace period
-	
+
 	return c.clientset.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{
 		GracePeriodSeconds: &gracePeriod,
 	})
 }
 
-// CreateOptimizedPod creates a new pod with only running containers
-func (c *Client) CreateOptimizedPod(ctx context.Context, originalPod *corev1.Pod, targetNode string, containerStates []types.ContainerState, checkpointPVC string) (*corev1.Pod, error) {
+// CreateOptimizedPod creates a new pod with only running containers.
+func (c *Client) CreateOptimizedPod(ctx context.Context, originalPod *corev1.Pod, targetNode string, containerStates []types.ContainerState, checkpointPVC string, stageMountPath string) (*corev1.Pod, error) {
 	// Create new pod spec based on original but optimized
 	newPod := originalPod.DeepCopy()
-	
+
 	// Clear status and metadata that should not be copied
 	newPod.Status = corev1.PodStatus{}
+	// GenerateName 으로 K8s 가 충돌 없는 유니크 이름을 부여하게 한다.
+	// WHY: 과거엔 "%s-migrated-%d"(초 단위 timestamp)로 직접 이름을 정해, 같은 Pod 의
+	//      동시 마이그레이션이 같은 이름을 만들어 `pods "..." already exists` 로 실패했다.
+	//      Create() 반환값(newPod.Name)에 실제 부여된 이름이 담기므로 호출부는 그대로 동작한다.
+	//      DNS-1123(이름 253자) 보호: GenerateName prefix(<=247자) + 임의 suffix.
+	migratedPrefix := fmt.Sprintf("%s-migrated-", originalPod.Name)
+	if len(migratedPrefix) > 247 {
+		migratedPrefix = migratedPrefix[:247]
+	}
 	newPod.ObjectMeta = metav1.ObjectMeta{
-		Name:      fmt.Sprintf("%s-migrated-%d", originalPod.Name, time.Now().Unix()),
-		Namespace: originalPod.Namespace,
-		Labels:    originalPod.Labels,
+		GenerateName: migratedPrefix,
+		Namespace:    originalPod.Namespace,
+		Labels:       map[string]string{},
+		Annotations:  originalPod.Annotations,
 	}
-	
-	// Add migration labels
-	if newPod.Labels == nil {
-		newPod.Labels = make(map[string]string)
-	}
+
+	// ReplicaSet/Deployment selector와 겹치지 않도록 원본 labels를 복제하지 않고
+	// migration 전용 라벨만 부여한다.
 	newPod.Labels["migration.ai-storage/original-pod"] = originalPod.Name
 	newPod.Labels["migration.ai-storage/target-node"] = targetNode
-	
+	newPod.Labels["migration.ai-storage/job"] = "true"
+
 	// Set node selector for target node
 	newPod.Spec.NodeName = targetNode
-	
+
 	// Filter containers - only include those that should be migrated
 	var optimizedContainers []corev1.Container
+	needsStageScratch := false
 	for _, container := range newPod.Spec.Containers {
 		for _, state := range containerStates {
 			if container.Name == state.Name && state.ShouldMigrate {
+				hasMountPath := func(path string) bool {
+					for _, vm := range container.VolumeMounts {
+						if vm.MountPath == path {
+							return true
+						}
+					}
+					return false
+				}
+
 				// Add checkpoint volume mount if specified
 				if checkpointPVC != "" {
-					container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
-						Name:      "checkpoint-volume",
-						MountPath: "/migration-checkpoint",
-					})
+					if stageMountPath == "" {
+						stageMountPath = "/migration-checkpoint"
+					}
+					mountPath := stageMountPath
+					if hasMountPath(mountPath) {
+						mountPath = "/migration-checkpoint"
+					}
+					if !hasMountPath(mountPath) {
+						container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+							Name:      "checkpoint-volume",
+							MountPath: mountPath,
+						})
+					}
+				} else if stageMountPath != "" {
+					// 체크포인트 PVC가 없을 때도 stage 경로가 필요하다. 기존 볼륨과 겹치면 emptyDir를 붙이지 않는다.
+					if !hasMountPath(stageMountPath) {
+						container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+							Name:      "migration-stage-scratch",
+							MountPath: stageMountPath,
+						})
+						needsStageScratch = true
+					}
 				}
 				optimizedContainers = append(optimizedContainers, container)
 				break
 			}
 		}
 	}
-	
+
 	newPod.Spec.Containers = optimizedContainers
-	
+
 	// Add checkpoint volume if specified
 	if checkpointPVC != "" {
 		newPod.Spec.Volumes = append(newPod.Spec.Volumes, corev1.Volume{
@@ -199,6 +406,13 @@ func (c *Client) CreateOptimizedPod(ctx context.Context, originalPod *corev1.Pod
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: checkpointPVC,
 				},
+			},
+		})
+	} else if needsStageScratch {
+		newPod.Spec.Volumes = append(newPod.Spec.Volumes, corev1.Volume{
+			Name: "migration-stage-scratch",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		})
 	}
@@ -214,13 +428,13 @@ func (c *Client) GetPodMetrics(ctx context.Context, namespace, name string) (*ty
 	}
 
 	var totalCPU, totalMemory int64
-	
+
 	for _, container := range podMetrics.Containers {
 		cpu := container.Usage[corev1.ResourceCPU]
 		memory := container.Usage[corev1.ResourceMemory]
-		
-		totalCPU += cpu.MilliValue()     // Convert to millicores
-		totalMemory += memory.Value()    // Bytes
+
+		totalCPU += cpu.MilliValue()  // Convert to millicores
+		totalMemory += memory.Value() // Bytes
 	}
 
 	return &types.ResourceUsage{
@@ -256,24 +470,375 @@ func (c *Client) WaitForPodReady(ctx context.Context, namespace, name string, ti
 	return fmt.Errorf("timeout waiting for pod to be ready")
 }
 
-// GetWorkloadReplicas gets the current replica count for a workload (Deployment, StatefulSet, ReplicaSet)
+const (
+	WorkloadTypeAuto        = "auto"
+	WorkloadTypeDeployment  = "Deployment"
+	WorkloadTypeStatefulSet = "StatefulSet"
+	WorkloadTypeReplicaSet  = "ReplicaSet"
+	WorkloadTypeJob         = "Job"
+	WorkloadTypePod         = "Pod"
+	WorkloadTypeWorkflow    = "Workflow"
+
+	PolicyTypeAutoscaling   = "autoscaling"
+	PolicyTypeMigration     = "migration"
+	PolicyTypePreemption    = "preemption"
+	PolicyTypeCaching       = "caching"
+	PolicyTypeLoadBalancing = "loadbalancing"
+	PolicyTypeProvisioning  = "provisioning"
+)
+
+// WaitingForTargetError는 정책 대상 리소스/Pod가 아직 생성되지 않았을 때 반환한다.
+// 컨트롤러는 이 에러를 Failed가 아니라 status=WaitingForTarget + requeue로 처리해야 한다.
+type WaitingForTargetError struct {
+	Namespace    string
+	Name         string
+	WorkloadType string
+	PolicyType   string
+	Reason       string
+}
+
+func (e *WaitingForTargetError) Error() string {
+	return fmt.Sprintf("waiting for target namespace=%s name=%s workloadType=%s policyType=%s reason=%s",
+		e.Namespace, e.Name, e.WorkloadType, e.PolicyType, e.Reason)
+}
+
+func NewWaitingForTargetError(namespace, name, workloadType, policyType, reason string) *WaitingForTargetError {
+	return &WaitingForTargetError{
+		Namespace:    namespace,
+		Name:         name,
+		WorkloadType: normalizeWorkloadType(workloadType),
+		PolicyType:   normalizePolicyType(policyType),
+		Reason:       reason,
+	}
+}
+
+// IsWaitingForTarget는 호출부에서 status=WaitingForTarget/requeue 판정에 사용한다.
+func IsWaitingForTarget(err error) bool {
+	var waiting *WaitingForTargetError
+	return errors.As(err, &waiting)
+}
+
+// WorkloadTarget은 OrchestrationPolicy.targetWorkload를 실제 Kubernetes 대상과 Pod 목록으로 해석한 결과다.
+type WorkloadTarget struct {
+	Kind        string
+	Namespace   string
+	Name        string
+	Selector    string
+	Stage       string
+	Pods        []corev1.Pod
+	RunningPods []corev1.Pod
+}
+
+// ResolveTargetPods는 migration/preemption처럼 최종적으로 Pod가 필요한 정책에서 사용한다.
+func (c *Client) ResolveTargetPods(ctx context.Context, namespace, name, workloadType, policyType, stage string) ([]corev1.Pod, string, error) {
+	target, err := c.ResolveWorkloadTarget(ctx, namespace, name, workloadType, policyType, stage, true)
+	if err != nil {
+		return nil, "", err
+	}
+	return target.RunningPods, target.Kind, nil
+}
+
+// ResolveWorkloadTarget은 targetWorkload를 kind별로 해석한다.
+//
+// 자동 탐색 순서:
+//
+//	Deployment -> StatefulSet -> Job -> Pod -> Workflow
+//
+// 정책별 허용 kind:
+//
+//	autoscaling  : Deployment/StatefulSet/ReplicaSet
+//	migration    : Deployment/StatefulSet/Job/Pod/Workflow
+//	preemption   : Deployment/StatefulSet/Job/Pod/Workflow
+//	caching 등   : Deployment/StatefulSet/Job/Pod/Workflow
+//
+// target이 아직 없으면 WaitingForTargetError를 반환한다.
+func (c *Client) ResolveWorkloadTarget(ctx context.Context, namespace, name, workloadType, policyType, stage string, requireRunningPod bool) (*WorkloadTarget, error) {
+	if namespace == "" || name == "" {
+		return nil, fmt.Errorf("invalid target: namespace and name are required (namespace=%q name=%q)", namespace, name)
+	}
+
+	policyType = normalizePolicyType(policyType)
+	requestedKind := normalizeWorkloadType(workloadType)
+	candidateKinds := candidateWorkloadKinds(policyType, requestedKind)
+
+	var lastErr error
+	for _, kind := range candidateKinds {
+		target, err := c.resolveWorkloadTargetByKind(ctx, namespace, name, kind, stage)
+		if err != nil {
+			if apierrors.IsNotFound(err) || IsWaitingForTarget(err) {
+				lastErr = err
+				continue
+			}
+			lastErr = err
+			continue
+		}
+
+		if requireRunningPod && len(target.RunningPods) == 0 {
+			return nil, NewWaitingForTargetError(namespace, name, target.Kind, policyType,
+				fmt.Sprintf("target resolved but no running pod found (selector=%s pods=%d)", target.Selector, len(target.Pods)))
+		}
+		return target, nil
+	}
+
+	if lastErr != nil && !apierrors.IsNotFound(lastErr) && !IsWaitingForTarget(lastErr) {
+		return nil, lastErr
+	}
+	return nil, NewWaitingForTargetError(namespace, name, requestedKind, policyType, "target resource not found by configured kind order")
+}
+
+func (c *Client) resolveWorkloadTargetByKind(ctx context.Context, namespace, name, kind, stage string) (*WorkloadTarget, error) {
+	kind = normalizeWorkloadType(kind)
+
+	switch kind {
+	case WorkloadTypeDeployment:
+		deployment, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		selector := metav1.FormatLabelSelector(deployment.Spec.Selector)
+		pods, err := c.listPodsBySelector(ctx, namespace, selector)
+		if err != nil {
+			return nil, err
+		}
+		return newWorkloadTarget(WorkloadTypeDeployment, namespace, name, selector, stage, pods), nil
+
+	case WorkloadTypeStatefulSet:
+		statefulSet, err := c.clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		selector := metav1.FormatLabelSelector(statefulSet.Spec.Selector)
+		pods, err := c.listPodsBySelector(ctx, namespace, selector)
+		if err != nil {
+			return nil, err
+		}
+		return newWorkloadTarget(WorkloadTypeStatefulSet, namespace, name, selector, stage, pods), nil
+
+	case WorkloadTypeReplicaSet:
+		replicaSet, err := c.clientset.AppsV1().ReplicaSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		selector := metav1.FormatLabelSelector(replicaSet.Spec.Selector)
+		pods, err := c.listPodsBySelector(ctx, namespace, selector)
+		if err != nil {
+			return nil, err
+		}
+		return newWorkloadTarget(WorkloadTypeReplicaSet, namespace, name, selector, stage, pods), nil
+
+	case WorkloadTypeJob:
+		job, err := c.clientset.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		selectors := make([]string, 0, 3)
+		if job.Spec.Selector != nil {
+			selectors = append(selectors, metav1.FormatLabelSelector(job.Spec.Selector))
+		}
+		selectors = append(selectors,
+			labels.SelectorFromSet(labels.Set{"batch.kubernetes.io/job-name": name}).String(),
+			labels.SelectorFromSet(labels.Set{"job-name": name}).String(),
+		)
+
+		pods, selector, err := c.listPodsBySelectors(ctx, namespace, selectors)
+		if err != nil {
+			return nil, err
+		}
+		return newWorkloadTarget(WorkloadTypeJob, namespace, name, selector, stage, pods), nil
+
+	case WorkloadTypePod:
+		pod, err := c.clientset.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+		return newWorkloadTarget(WorkloadTypePod, namespace, name,
+			fields.OneTermEqualSelector("metadata.name", name).String(), stage, []corev1.Pod{*pod}), nil
+
+	case WorkloadTypeWorkflow:
+		selectors := []string{
+			labels.SelectorFromSet(labels.Set{"workflows.argoproj.io/workflow": name}).String(),
+		}
+		if stage != "" {
+			selectors = []string{selectors[0] + "," + labels.SelectorFromSet(labels.Set{"pipeline.kubeflow.org/stage": stage}).String()}
+		}
+
+		pods, selector, err := c.listPodsBySelectors(ctx, namespace, selectors)
+		if err != nil {
+			return nil, err
+		}
+		if len(pods) == 0 {
+			return nil, NewWaitingForTargetError(namespace, name, WorkloadTypeWorkflow, "", fmt.Sprintf("workflow pods not found (selector=%s)", selector))
+		}
+		return newWorkloadTarget(WorkloadTypeWorkflow, namespace, name, selector, stage, pods), nil
+
+	default:
+		return nil, fmt.Errorf("unsupported workload type: %s", kind)
+	}
+}
+
+func newWorkloadTarget(kind, namespace, name, selector, stage string, pods []corev1.Pod) *WorkloadTarget {
+	sortPods(pods)
+	running := make([]corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if pod.Status.Phase == corev1.PodRunning {
+			running = append(running, pod)
+		}
+	}
+	return &WorkloadTarget{
+		Kind:        kind,
+		Namespace:   namespace,
+		Name:        name,
+		Selector:    selector,
+		Stage:       stage,
+		Pods:        pods,
+		RunningPods: running,
+	}
+}
+
+func (c *Client) listPodsBySelector(ctx context.Context, namespace, selector string) ([]corev1.Pod, error) {
+	pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods by selector %q: %w", selector, err)
+	}
+	items := append([]corev1.Pod(nil), pods.Items...)
+	sortPods(items)
+	return items, nil
+}
+
+func (c *Client) listPodsBySelectors(ctx context.Context, namespace string, selectors []string) ([]corev1.Pod, string, error) {
+	var lastErr error
+	for _, selector := range selectors {
+		if strings.TrimSpace(selector) == "" {
+			continue
+		}
+		pods, err := c.listPodsBySelector(ctx, namespace, selector)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(pods) > 0 {
+			return pods, selector, nil
+		}
+	}
+	if lastErr != nil {
+		return nil, strings.Join(selectors, " | "), lastErr
+	}
+	return nil, strings.Join(selectors, " | "), nil
+}
+
+func sortPods(pods []corev1.Pod) {
+	sort.SliceStable(pods, func(i, j int) bool {
+		iTime := pods[i].CreationTimestamp.Time
+		jTime := pods[j].CreationTimestamp.Time
+		if !iTime.Equal(jTime) {
+			return iTime.Before(jTime)
+		}
+		return pods[i].Name < pods[j].Name
+	})
+}
+
+func normalizePolicyType(policyType string) string {
+	p := strings.ToLower(strings.TrimSpace(policyType))
+	switch p {
+	case "scale", "scaling", "autoscale", "auto-scaling", "auto_scaling":
+		return PolicyTypeAutoscaling
+	case "migrate":
+		return PolicyTypeMigration
+	case "preempt":
+		return PolicyTypePreemption
+	case "cache":
+		return PolicyTypeCaching
+	case "loadbalance", "load-balancing", "load_balancing", "loadbalanceing":
+		return PolicyTypeLoadBalancing
+	case "provision", "preprovisioning", "pre-provisioning":
+		return PolicyTypeProvisioning
+	default:
+		if p == "" {
+			return "generic"
+		}
+		return p
+	}
+}
+
+func normalizeWorkloadType(workloadType string) string {
+	s := strings.ToLower(strings.TrimSpace(workloadType))
+	s = strings.ReplaceAll(s, "-", "")
+	s = strings.ReplaceAll(s, "_", "")
+	s = strings.ReplaceAll(s, " ", "")
+
+	switch s {
+	case "", "auto", "default":
+		return WorkloadTypeAuto
+	case "deployment", "deploy", "deployments":
+		return WorkloadTypeDeployment
+	case "statefulset", "sts", "statefulsets":
+		return WorkloadTypeStatefulSet
+	case "replicaset", "rs", "replicasets":
+		return WorkloadTypeReplicaSet
+	case "job", "jobs":
+		return WorkloadTypeJob
+	case "pod", "pods":
+		return WorkloadTypePod
+	case "workflow", "workflows", "argoworkflow", "argoworkflows":
+		return WorkloadTypeWorkflow
+	default:
+		return workloadType
+	}
+}
+
+func candidateWorkloadKinds(policyType, requestedKind string) []string {
+	if requestedKind != "" && requestedKind != WorkloadTypeAuto {
+		return []string{requestedKind}
+	}
+
+	switch normalizePolicyType(policyType) {
+	case PolicyTypeAutoscaling:
+		return []string{WorkloadTypeDeployment, WorkloadTypeStatefulSet, WorkloadTypeReplicaSet}
+	case PolicyTypeMigration, PolicyTypePreemption, PolicyTypeCaching, PolicyTypeLoadBalancing, PolicyTypeProvisioning:
+		return []string{WorkloadTypeDeployment, WorkloadTypeStatefulSet, WorkloadTypeJob, WorkloadTypePod, WorkloadTypeWorkflow}
+	default:
+		return []string{WorkloadTypeDeployment, WorkloadTypeStatefulSet, WorkloadTypeJob, WorkloadTypePod, WorkloadTypeWorkflow}
+	}
+}
+
+func (c *Client) resolveScalableWorkloadKind(ctx context.Context, namespace, name, workloadType string) (string, error) {
+	target, err := c.ResolveWorkloadTarget(ctx, namespace, name, workloadType, PolicyTypeAutoscaling, "", false)
+	if err != nil {
+		return "", err
+	}
+	switch target.Kind {
+	case WorkloadTypeDeployment, WorkloadTypeStatefulSet, WorkloadTypeReplicaSet:
+		return target.Kind, nil
+	default:
+		return "", fmt.Errorf("unsupported scalable workload type: %s", target.Kind)
+	}
+}
+
+// GetWorkloadReplicas gets the current replica count for a workload.
+// workloadType가 auto/empty이면 Deployment -> StatefulSet -> ReplicaSet 순서로 자동 탐색한다.
 func (c *Client) GetWorkloadReplicas(ctx context.Context, namespace, name, workloadType string) (int32, error) {
-	switch workloadType {
-	case "Deployment":
+	resolvedKind, err := c.resolveScalableWorkloadKind(ctx, namespace, name, workloadType)
+	if err != nil {
+		return 0, err
+	}
+
+	switch resolvedKind {
+	case WorkloadTypeDeployment:
 		deployment, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return 0, fmt.Errorf("failed to get deployment: %w", err)
 		}
 		return deployment.Status.Replicas, nil
 
-	case "StatefulSet":
+	case WorkloadTypeStatefulSet:
 		statefulSet, err := c.clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return 0, fmt.Errorf("failed to get statefulset: %w", err)
 		}
 		return statefulSet.Status.Replicas, nil
 
-	case "ReplicaSet":
+	case WorkloadTypeReplicaSet:
 		replicaSet, err := c.clientset.AppsV1().ReplicaSets(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return 0, fmt.Errorf("failed to get replicaset: %w", err)
@@ -281,14 +846,20 @@ func (c *Client) GetWorkloadReplicas(ctx context.Context, namespace, name, workl
 		return replicaSet.Status.Replicas, nil
 
 	default:
-		return 0, fmt.Errorf("unsupported workload type: %s", workloadType)
+		return 0, fmt.Errorf("unsupported workload type: %s", resolvedKind)
 	}
 }
 
-// ScaleWorkload scales a workload to the desired number of replicas
+// ScaleWorkload scales a workload to the desired number of replicas.
+// workloadType가 auto/empty이면 Deployment -> StatefulSet -> ReplicaSet 순서로 자동 탐색한다.
 func (c *Client) ScaleWorkload(ctx context.Context, namespace, name, workloadType string, replicas int32) error {
-	switch workloadType {
-	case "Deployment":
+	resolvedKind, err := c.resolveScalableWorkloadKind(ctx, namespace, name, workloadType)
+	if err != nil {
+		return err
+	}
+
+	switch resolvedKind {
+	case WorkloadTypeDeployment:
 		deployment, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to get deployment: %w", err)
@@ -300,7 +871,7 @@ func (c *Client) ScaleWorkload(ctx context.Context, namespace, name, workloadTyp
 		}
 		return nil
 
-	case "StatefulSet":
+	case WorkloadTypeStatefulSet:
 		statefulSet, err := c.clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to get statefulset: %w", err)
@@ -312,7 +883,7 @@ func (c *Client) ScaleWorkload(ctx context.Context, namespace, name, workloadTyp
 		}
 		return nil
 
-	case "ReplicaSet":
+	case WorkloadTypeReplicaSet:
 		replicaSet, err := c.clientset.AppsV1().ReplicaSets(namespace).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to get replicaset: %w", err)
@@ -325,68 +896,29 @@ func (c *Client) ScaleWorkload(ctx context.Context, namespace, name, workloadTyp
 		return nil
 
 	default:
-		return fmt.Errorf("unsupported workload type: %s", workloadType)
+		return fmt.Errorf("unsupported workload type: %s", resolvedKind)
 	}
 }
 
-// GetWorkloadPodMetrics gets the average CPU, Memory, GPU, and Storage I/O metrics for all pods in a workload
+// GetWorkloadPodMetrics gets the average CPU, Memory, GPU, and Storage I/O metrics for all pods in a workload.
+// Deployment/StatefulSet/Job/Pod/Workflow를 동일 resolver로 해석한다.
 func (c *Client) GetWorkloadPodMetrics(ctx context.Context, namespace, workloadName string) (cpuPercent, memoryPercent, gpuPercent int32, storageReadMBps, storageWriteMBps, storageIOPS int64, err error) {
-	// Get label selector for the workload
-	// Try Deployment first, then StatefulSet, then ReplicaSet
-	var labelSelector string
-
-	// Try to get Deployment
-	deployment, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, workloadName, metav1.GetOptions{})
-	if err == nil {
-		// Convert matchLabels to selector string
-		labelSelector = metav1.FormatLabelSelector(deployment.Spec.Selector)
-	} else {
-		// Try StatefulSet
-		statefulSet, err := c.clientset.AppsV1().StatefulSets(namespace).Get(ctx, workloadName, metav1.GetOptions{})
-		if err == nil {
-			labelSelector = metav1.FormatLabelSelector(statefulSet.Spec.Selector)
-		} else {
-			// Try ReplicaSet
-			replicaSet, err := c.clientset.AppsV1().ReplicaSets(namespace).Get(ctx, workloadName, metav1.GetOptions{})
-			if err == nil {
-				labelSelector = metav1.FormatLabelSelector(replicaSet.Spec.Selector)
-			} else {
-				// Fallback to app=workloadName
-				labelSelector = fmt.Sprintf("app=%s", workloadName)
-			}
-		}
-	}
-
-	// List pods with the determined label selector
-	pods, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: labelSelector,
-	})
+	target, err := c.ResolveWorkloadTarget(ctx, namespace, workloadName, WorkloadTypeAuto, "metrics", "", true)
 	if err != nil {
-		return 0, 0, 0, 0, 0, 0, fmt.Errorf("failed to list pods: %w", err)
-	}
-
-	if len(pods.Items) == 0 {
-		return 0, 0, 0, 0, 0, 0, fmt.Errorf("no pods found for workload %s (selector: %s)", workloadName, labelSelector)
+		return 0, 0, 0, 0, 0, 0, err
 	}
 
 	var totalCPUPercent, totalMemoryPercent, totalGPUPercent int64
 	var totalStorageReadMBps, totalStorageWriteMBps, totalStorageIOPS int64
 	podCount := int64(0)
 
-	for _, pod := range pods.Items {
-		// Skip pods that are not running
-		if pod.Status.Phase != corev1.PodRunning {
-			continue
-		}
-
-		// Get pod metrics
+	for _, pod := range target.RunningPods {
 		podMetrics, err := c.metricsClientset.MetricsV1beta1().PodMetricses(namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 		if err != nil {
-			// If metrics not available for this pod, skip it
+			// metrics-server가 아직 값을 만들지 못한 Pod는 평균에서 제외한다.
 			continue
 		}
 
-		// Calculate resource usage for this pod
 		var podCPUMillis, podMemoryBytes int64
 		var podCPURequests, podMemoryRequests int64
 
@@ -395,7 +927,6 @@ func (c *Client) GetWorkloadPodMetrics(ctx context.Context, namespace, workloadN
 			podMemoryBytes += container.Usage.Memory().Value()
 		}
 
-		// Get resource requests from pod spec
 		for _, container := range pod.Spec.Containers {
 			if cpuReq := container.Resources.Requests.Cpu(); cpuReq != nil {
 				podCPURequests += cpuReq.MilliValue()
@@ -405,7 +936,6 @@ func (c *Client) GetWorkloadPodMetrics(ctx context.Context, namespace, workloadN
 			}
 		}
 
-		// Calculate percentage (usage / requests * 100)
 		if podCPURequests > 0 {
 			totalCPUPercent += (podCPUMillis * 100) / podCPURequests
 		}
@@ -413,11 +943,9 @@ func (c *Client) GetWorkloadPodMetrics(ctx context.Context, namespace, workloadN
 			totalMemoryPercent += (podMemoryBytes * 100) / podMemoryRequests
 		}
 
-		// GPU metrics - attempt to get from custom metrics or calculate from resource requests
 		gpuPercent := c.calculatePodGPUUtilization(&pod)
 		totalGPUPercent += int64(gpuPercent)
 
-		// Storage I/O metrics - get from pod's cgroup stats or Prometheus
 		storageRead, storageWrite, iops := c.calculatePodStorageMetrics(ctx, &pod)
 		totalStorageReadMBps += storageRead
 		totalStorageWriteMBps += storageWrite
@@ -427,10 +955,9 @@ func (c *Client) GetWorkloadPodMetrics(ctx context.Context, namespace, workloadN
 	}
 
 	if podCount == 0 {
-		return 0, 0, 0, 0, 0, 0, fmt.Errorf("no running pods with metrics found for workload %s", workloadName)
+		return 0, 0, 0, 0, 0, 0, NewWaitingForTargetError(namespace, workloadName, target.Kind, "metrics", "no running pods with metrics found")
 	}
 
-	// Calculate average
 	avgCPU := int32(totalCPUPercent / podCount)
 	avgMemory := int32(totalMemoryPercent / podCount)
 	avgGPU := int32(totalGPUPercent / podCount)
@@ -627,12 +1154,14 @@ func (c *Client) execCommandInPod(ctx context.Context, namespace, podName, conta
 		Namespace(namespace).
 		SubResource("exec")
 
+	// PodExecOptions 는 core v1 전용 쿼리로 직렬화되어야 하며, metav1.ParameterCodec 은
+	// 해당 타입이 등록돼 있지 않아 URL 에 stdout/stderr 가 누락될 수 있다(업그레이드 실패).
 	req.VersionedParams(&corev1.PodExecOptions{
 		Container: containerName,
 		Command:   command,
 		Stdout:    true,
 		Stderr:    true,
-	}, metav1.ParameterCodec)
+	}, scheme.ParameterCodec)
 
 	exec, err := remotecommand.NewSPDYExecutor(c.config, "POST", req.URL())
 	if err != nil {
@@ -646,6 +1175,33 @@ func (c *Client) execCommandInPod(ctx context.Context, namespace, podName, conta
 	})
 
 	return stdout.String(), stderr.String(), err
+}
+
+// FileExistsInPod은 지정 컨테이너에서 absPath가 일반 파일로 존재하는지 확인한다.
+//
+// exec 비정상 종료는 파일 없음으로 간주한다(네트워크 오류와 구분하지 않음).
+func (c *Client) FileExistsInPod(ctx context.Context, namespace, podName, containerName, absPath string) (bool, error) {
+	_, _, err := c.execCommandInPod(ctx, namespace, podName, containerName, []string{"test", "-f", absPath})
+	if err == nil {
+		return true, nil
+	}
+	return false, nil
+}
+
+// TouchPathInPod은 absPath의 부모 디렉터리를 만든 뒤 빈 파일을 생성한다.
+//
+// output stage의 _SUCCESS 마커 등, Pod 파일시스템에 완료 표식을 남길 때 사용한다.
+func (c *Client) TouchPathInPod(ctx context.Context, namespace, podName, containerName, absPath string) error {
+	dir := filepath.Dir(absPath)
+	_, stderr, err := c.execCommandInPod(ctx, namespace, podName, containerName, []string{"mkdir", "-p", dir})
+	if err != nil {
+		return fmt.Errorf("mkdir in pod: %w (stderr=%s)", err, strings.TrimSpace(stderr))
+	}
+	_, stderr, err = c.execCommandInPod(ctx, namespace, podName, containerName, []string{"touch", absPath})
+	if err != nil {
+		return fmt.Errorf("touch in pod: %w (stderr=%s)", err, strings.TrimSpace(stderr))
+	}
+	return nil
 }
 
 // GetPodGPUMetrics attempts to get real GPU metrics from custom metrics API
@@ -1264,9 +1820,255 @@ func (c *Client) estimateStorageMetricsFromPVC(ctx context.Context, pod *corev1.
 		totalGB = 1000 // Cap at 1TB
 	}
 
-	readMBps = 100 + (totalGB * 40 / 100)    // 100-500 MB/s
-	writeMBps = 30 + (totalGB * 12 / 100)    // 30-150 MB/s
-	iops = 1000 + (totalGB * 100 / 100)      // 1000-2000 IOPS
+	readMBps = 100 + (totalGB * 40 / 100) // 100-500 MB/s
+	writeMBps = 30 + (totalGB * 12 / 100) // 30-150 MB/s
+	iops = 1000 + (totalGB * 100 / 100)   // 1000-2000 IOPS
 
 	return readMBps, writeMBps, iops
+}
+
+type cachePrefetchPodResult struct {
+	Bytes int64  `json:"bytes"`
+	Files int64  `json:"files"`
+	Error string `json:"error,omitempty"`
+}
+
+// RunCachePrefetchPod은 source PVC를 마운트한 임시 Pod에서 sourcePath 하위 파일을 스캔해 로드 크기를 계산한다.
+func (c *Client) RunCachePrefetchPod(ctx context.Context, namespace, pvcName, sourcePath, jobID string) (int64, int64, error) {
+	trimmedJobID := strings.ToLower(strings.ReplaceAll(jobID, "_", "-"))
+	if trimmedJobID == "" {
+		trimmedJobID = fmt.Sprintf("%d", time.Now().Unix())
+	}
+	if len(trimmedJobID) > 32 {
+		trimmedJobID = trimmedJobID[:32]
+	}
+	podName := fmt.Sprintf("cache-prefetch-%s", trimmedJobID)
+
+	if sourcePath == "" || sourcePath == "." {
+		sourcePath = "/data"
+	}
+
+	script := strings.Join([]string{
+		"import json, os, sys",
+		`root = os.path.normpath(sys.argv[1] if len(sys.argv) > 1 else "/data")`,
+		"if not os.path.exists(root):",
+		`  print(json.dumps({"error": f"source path not found: {root}"}))`,
+		"  raise SystemExit(2)",
+		"total = 0",
+		"files = 0",
+		"for dirpath, _, filenames in os.walk(root):",
+		"  for name in filenames:",
+		"    path = os.path.join(dirpath, name)",
+		"    if os.path.isfile(path):",
+		"      files += 1",
+		"      total += os.path.getsize(path)",
+		"if files == 0:",
+		`  print(json.dumps({"error": f"no regular files under {root}"}))`,
+		"  raise SystemExit(3)",
+		`print(json.dumps({"bytes": total, "files": files}))`,
+	}, "\n")
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app":                             "ai-storage-orchestrator",
+				"component":                       "cache-prefetch",
+				"ai-storage.orchestrator/cacheID": jobID,
+			},
+			// WHY: cache-prefetch Pod 은 main container(prefetch) 가 종료되면 즉시 정리해야
+			//      한다. 클러스터의 insight-trace mutating webhook 이 사이드카를 주입할 때
+			//      Pod annotation 으로 main container 를 식별한다. 아래 세 키를 모두 박아
+			//      ① insight-trace 의 자동 종료 로직(mlops.keti.io/main-container),
+			//      ② demo 표준 키(insight-trace.keti.io/main-container) 와 호환되게 한다.
+			Annotations: map[string]string{
+				"insight-trace.keti.io/main-container": "prefetch",
+				"mlops.keti.io/main-container":         "prefetch",
+				"workload.keti.io/main-container":      "prefetch",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			// WHY: insight-trace 사이드카가 Kubernetes API 로 자기 Pod 상태를 polling 해서
+			//      main container 종료 시 자신을 끝낸다. default SA 는 자기 Pod GET 권한이
+			//      없어 polling 이 매번 401/403 으로 실패하고 사이드카가 영원히 살아남아
+			//      Pod 이 Completed 되지 못한다. orchestrator 의 SA(권한 보유) 를 위임한다.
+			ServiceAccountName: "ai-storage-orchestrator",
+			Containers: []corev1.Container{
+				{
+					Name:            "prefetch",
+					Image:           "python:3.11-slim",
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Command: []string{
+						"python3", "-c", script, sourcePath,
+					},
+					VolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      "source-pvc",
+							MountPath: "/data",
+							ReadOnly:  true,
+						},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "source-pvc",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName,
+							ReadOnly:  true,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if _, err := c.clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return 0, 0, fmt.Errorf("create cache-prefetch pod %s/%s: %w", namespace, podName, err)
+	}
+	logPrefix := fmt.Sprintf("cache-prefetch pod %s/%s", namespace, podName)
+	defer func() {
+		_ = c.clientset.CoreV1().Pods(namespace).Delete(context.Background(), podName, metav1.DeleteOptions{})
+	}()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
+	defer cancel()
+
+	for {
+		select {
+		case <-waitCtx.Done():
+			return 0, 0, fmt.Errorf("%s timeout: %w", logPrefix, waitCtx.Err())
+		case <-time.After(2 * time.Second):
+		}
+
+		current, err := c.clientset.CoreV1().Pods(namespace).Get(waitCtx, podName, metav1.GetOptions{})
+		if err != nil {
+			return 0, 0, fmt.Errorf("get %s: %w", logPrefix, err)
+		}
+
+		// WHY: insight-trace sidecar 가 prefetch 종료 후에도 살아남으면 Pod.Phase 가 영원히
+		//      Running 으로 머무른다. main container 단위 Terminated 만으로 결과를 결정해
+		//      sidecar 의 lifecycle 과 무관하게 cache 정책이 PASS 되도록 한다.
+		if isCachePrefetchContainerTerminated(current) {
+			result, err := readCachePrefetchResult(waitCtx, c, namespace, podName, current, logPrefix)
+			if err != nil {
+				return 0, 0, err
+			}
+			return result.Bytes, result.Files, nil
+		}
+
+		switch current.Status.Phase {
+		case corev1.PodSucceeded, corev1.PodFailed:
+			var logText string
+			logErrs := make([]string, 0, 3)
+			for i := 0; i < 3; i++ {
+				logReq := c.clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{Container: "prefetch"})
+				rawLogs, logErr := logReq.Do(waitCtx).Raw()
+				if logErr == nil {
+					logText = strings.TrimSpace(string(rawLogs))
+					if logText != "" {
+						break
+					}
+					logErrs = append(logErrs, "empty logs")
+				} else {
+					logErrs = append(logErrs, logErr.Error())
+					// Pod가 이미 정리됐더라도 직전 terminal 상태를 기준으로 fallback 판단 가능
+					if apierrors.IsNotFound(logErr) {
+						break
+					}
+				}
+				select {
+				case <-waitCtx.Done():
+					break
+				case <-time.After(800 * time.Millisecond):
+				}
+			}
+
+			if logText != "" {
+				lines := strings.Split(logText, "\n")
+				last := strings.TrimSpace(lines[len(lines)-1])
+
+				var result cachePrefetchPodResult
+				if err := json.Unmarshal([]byte(last), &result); err == nil {
+					if result.Error != "" {
+						return 0, 0, fmt.Errorf("%s error: %s", logPrefix, result.Error)
+					}
+					if current.Status.Phase == corev1.PodFailed {
+						return 0, 0, fmt.Errorf("%s failed without explicit error", logPrefix)
+					}
+					return result.Bytes, result.Files, nil
+				}
+
+				if current.Status.Phase == corev1.PodFailed {
+					return 0, 0, fmt.Errorf("%s failed: %s", logPrefix, logText)
+				}
+			}
+
+			// 로그 회수 실패 시 ContainerStatuses 종료 정보를 fallback으로 사용한다.
+			for _, cs := range current.Status.ContainerStatuses {
+				if cs.Name != "prefetch" || cs.State.Terminated == nil {
+					continue
+				}
+				t := cs.State.Terminated
+				if t.ExitCode == 0 {
+					return 0, 0, nil
+				}
+				return 0, 0, fmt.Errorf("%s terminated(exit=%d reason=%s message=%s logs=%s)",
+					logPrefix, t.ExitCode, t.Reason, strings.TrimSpace(t.Message), strings.Join(logErrs, " | "))
+			}
+			return 0, 0, fmt.Errorf("%s terminated but no logs/status details (logErrors=%s)", logPrefix, strings.Join(logErrs, " | "))
+		}
+	}
+}
+
+// isCachePrefetchContainerTerminated 는 cache-prefetch Pod 의 main container(prefetch)가
+// 종료되었는지만 본다. Sidecar 컨테이너(insight-trace 등) 의 살아있음 여부는 무시한다.
+func isCachePrefetchContainerTerminated(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == "prefetch" && cs.State.Terminated != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// readCachePrefetchResult 는 prefetch 컨테이너가 Terminated 된 시점에 로그 또는 종료 코드를
+// 기반으로 cache-prefetch 결과를 해석한다.
+func readCachePrefetchResult(ctx context.Context, c *Client, namespace, podName string, current *corev1.Pod, logPrefix string) (*cachePrefetchPodResult, error) {
+	// 로그 1차 시도: prefetch 컨테이너의 stdout
+	logReq := c.clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{Container: "prefetch"})
+	rawLogs, logErr := logReq.Do(ctx).Raw()
+	logText := strings.TrimSpace(string(rawLogs))
+
+	if logText != "" {
+		lines := strings.Split(logText, "\n")
+		last := strings.TrimSpace(lines[len(lines)-1])
+		var result cachePrefetchPodResult
+		if jerr := json.Unmarshal([]byte(last), &result); jerr == nil {
+			if result.Error != "" {
+				return nil, fmt.Errorf("%s error: %s", logPrefix, result.Error)
+			}
+			return &result, nil
+		}
+	}
+
+	// fallback: 종료 코드만 본다.
+	for _, cs := range current.Status.ContainerStatuses {
+		if cs.Name != "prefetch" || cs.State.Terminated == nil {
+			continue
+		}
+		t := cs.State.Terminated
+		if t.ExitCode == 0 {
+			return &cachePrefetchPodResult{}, nil
+		}
+		return nil, fmt.Errorf("%s prefetch container terminated exit=%d reason=%s message=%s logErr=%v",
+			logPrefix, t.ExitCode, t.Reason, strings.TrimSpace(t.Message), logErr)
+	}
+	return nil, fmt.Errorf("%s prefetch terminated but no logs/status details (logErr=%v)", logPrefix, logErr)
 }

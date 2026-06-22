@@ -2,11 +2,13 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
 	"time"
 
+	"ai-storage-orchestrator/pkg/k8s"
 	"ai-storage-orchestrator/pkg/types"
 
 	"github.com/google/uuid"
@@ -59,6 +61,31 @@ func (ac *AutoscalingController) CreateAutoscaler(req *types.AutoscalingRequest)
 	if err := ac.validateRequest(req); err != nil {
 		return nil, fmt.Errorf("validation failed: %w", err)
 	}
+	if req.WorkloadType == "" {
+		req.WorkloadType = k8s.WorkloadTypeAuto
+	}
+
+	// #9-B 멱등성: workload당 autoscaler 1개만 유지. 같은 namespace/name으로 이미
+	// active한 autoscaler가 있으면 새로 만들지 않고 기존 것을 반환한다. (중복 생성 시
+	// 여러 autoscaler가 같은 워크로드 replicas를 두고 충돌하고, DeleteAutoscaler가
+	// 호출되지 않아 goroutine이 무한 누적 → rate-limit 폭주.)
+	ac.autoscalersMux.RLock()
+	for _, j := range ac.autoscalers {
+		if j.Status == types.AutoscalingStatusActive &&
+			j.Request.WorkloadNamespace == req.WorkloadNamespace &&
+			j.Request.WorkloadName == req.WorkloadName {
+			existing := &types.AutoscalingResponse{
+				AutoscalingID: j.ID,
+				Status:        j.Status,
+				Message:       "Autoscaler already active for workload (reused)",
+				Details:       j.Details,
+			}
+			ac.autoscalersMux.RUnlock()
+			log.Printf("Autoscaler %s reused for %s/%s (idempotent)", j.ID, req.WorkloadNamespace, req.WorkloadName)
+			return existing, nil
+		}
+	}
+	ac.autoscalersMux.RUnlock()
 
 	// Generate unique autoscaler ID
 	autoscalerID := fmt.Sprintf("autoscaler-%s", uuid.New().String()[:8])
@@ -169,6 +196,11 @@ func (ac *AutoscalingController) runAutoscaler(job *AutoscalingJob) {
 			// Get current workload status
 			currentReplicas, err := ac.getCurrentReplicas(job)
 			if err != nil {
+				var waitingErr *k8s.WaitingForTargetError
+				if errors.As(err, &waitingErr) {
+					log.Printf("Autoscaler %s: Waiting for target workload (%v)", job.ID, err)
+					continue
+				}
 				log.Printf("Autoscaler %s: Failed to get current replicas: %v", job.ID, err)
 				continue
 			}
@@ -176,6 +208,11 @@ func (ac *AutoscalingController) runAutoscaler(job *AutoscalingJob) {
 			// Get current resource utilization (including storage I/O)
 			cpuUtil, memUtil, gpuUtil, storageRead, storageWrite, storageIOPS, err := ac.getResourceUtilization(job)
 			if err != nil {
+				var waitingErr *k8s.WaitingForTargetError
+				if errors.As(err, &waitingErr) {
+					log.Printf("Autoscaler %s: Waiting for metrics target (%v)", job.ID, err)
+					continue
+				}
 				log.Printf("Autoscaler %s: Failed to get resource utilization: %v", job.ID, err)
 				continue
 			}
@@ -405,7 +442,7 @@ func (ac *AutoscalingController) applyStabilizationWindow(job *AutoscalingJob, c
 
 // getCurrentReplicas returns the current number of replicas for the workload
 func (ac *AutoscalingController) getCurrentReplicas(job *AutoscalingJob) (int32, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	replicas, err := ac.k8sClient.GetWorkloadReplicas(ctx,
@@ -421,23 +458,14 @@ func (ac *AutoscalingController) getCurrentReplicas(job *AutoscalingJob) (int32,
 
 // getResourceUtilization returns current CPU, Memory, GPU, and Storage I/O metrics
 func (ac *AutoscalingController) getResourceUtilization(job *AutoscalingJob) (cpu, memory, gpu int32, storageRead, storageWrite, storageIOPS int64, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	cpuPercent, memoryPercent, gpuPercent, readMBps, writeMBps, iops, err := ac.k8sClient.GetWorkloadPodMetrics(ctx,
 		job.Request.WorkloadNamespace,
 		job.Request.WorkloadName)
 	if err != nil {
-		// If metrics server is not available or no metrics found, return simulated values
-		log.Printf("Autoscaler %s: Failed to get real metrics, using simulated values: %v", job.ID, err)
-		cpu = 50 + int32(time.Now().Unix()%40)
-		memory = 45 + int32(time.Now().Unix()%35)
-		gpu = 40 + int32(time.Now().Unix()%50)
-		// Simulate storage I/O for AI/ML workload
-		storageRead = 300 + int64(time.Now().Unix()%200)   // 300-500 MB/s
-		storageWrite = 80 + int64(time.Now().Unix()%70)    // 80-150 MB/s
-		storageIOPS = 2000 + int64(time.Now().Unix()%2000) // 2000-4000 IOPS
-		return cpu, memory, gpu, storageRead, storageWrite, storageIOPS, nil
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("get workload pod metrics: %w", err)
 	}
 
 	return cpuPercent, memoryPercent, gpuPercent, readMBps, writeMBps, iops, nil
@@ -471,7 +499,7 @@ func (ac *AutoscalingController) validateRequest(req *types.AutoscalingRequest) 
 		return fmt.Errorf("workload_namespace is required")
 	}
 	if req.WorkloadType == "" {
-		return fmt.Errorf("workload_type is required")
+		req.WorkloadType = k8s.WorkloadTypeAuto
 	}
 	if req.MinReplicas < 1 {
 		return fmt.Errorf("min_replicas must be at least 1")

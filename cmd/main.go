@@ -2,13 +2,20 @@ package main
 
 import (
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"ai-storage-orchestrator/pkg/apis"
+	"ai-storage-orchestrator/pkg/config"
 	"ai-storage-orchestrator/pkg/controller"
+	"ai-storage-orchestrator/pkg/etri"
+	"ai-storage-orchestrator/pkg/etri/pb"
+	"ai-storage-orchestrator/pkg/gluesys"
 	"ai-storage-orchestrator/pkg/k8s"
+
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -19,6 +26,14 @@ func main() {
 	}
 	kubeconfig := os.Getenv("KUBECONFIG")
 
+	// ConfigMap(config.yaml) 로드. ConfigMap 이 optional 이라 파일이 없을 수 있는데,
+	// 그 경우 Load 가 빌트인 기본값을 돌려주므로 fatal 로 막지 않고 경고만 남기고 진행한다.
+	appCfg, cfgErr := config.LoadDefault()
+	if cfgErr != nil {
+		log.Printf("WARN: failed to load config (using built-in defaults): %v", cfgErr)
+		appCfg = &config.Config{Provisioning: config.DefaultProvisioningConfig()}
+	}
+
 	log.Println("Starting AI Storage Orchestrator...")
 	// Initialize Kubernetes client
 	k8sClient, err := k8s.NewClient(kubeconfig)
@@ -27,8 +42,12 @@ func main() {
 	}
 	log.Println("Kubernetes client initialized successfully")
 
+	// Initialize Gluesys integration stub client (optional, best-effort).
+	gluesysClient := gluesys.NewStubClient(log.Default())
+	stagePlanStore := controller.NewStageExecutionPlanStore()
+
 	// Initialize migration controller
-	migrationController := controller.NewMigrationController(k8sClient)
+	migrationController := controller.NewMigrationController(k8sClient, gluesysClient, stagePlanStore)
 	log.Println("Migration controller initialized")
 
 	// Initialize autoscaling controller
@@ -40,7 +59,7 @@ func main() {
 	log.Println("Loadbalancing controller initialized")
 
 	// Initialize provisioning controller
-	provisioningController := controller.NewProvisioningController(k8sClient)
+	provisioningController := controller.NewProvisioningController(k8sClient, gluesysClient, stagePlanStore, &appCfg.Provisioning)
 	log.Println("Provisioning controller initialized")
 
 	// Initialize preemption controller
@@ -48,15 +67,34 @@ func main() {
 	log.Println("Preemption controller initialized")
 
 	// Initialize caching controller (글로벌 캐싱)
-	cachingController := controller.NewCachingController(k8sClient)
+	cachingController := controller.NewCachingController(k8sClient, gluesysClient)
 	log.Println("Caching controller initialized")
 
 	// Initialize insight controller (워크로드 시그니처 수집)
 	insightController := controller.NewInsightController()
 	log.Println("Insight controller initialized")
 
+	// Initialize ETRI integration service (in-memory repository + existing k8s client)
+	etriRepo := etri.NewInMemoryRepository()
+	etriSvc := etri.NewService(etriRepo, k8sClient)
+	etriHTTPHandler := etri.NewHTTPHandler(etriSvc)
+	log.Println("ETRI integration service initialized")
+
+	// Initialize gRPC server for ETRI integration (port 50051)
+	grpcPort := os.Getenv("GRPC_PORT")
+	if grpcPort == "" {
+		grpcPort = "50051"
+	}
+	lis, err := net.Listen("tcp", ":"+grpcPort)
+	if err != nil {
+		log.Fatalf("Failed to listen on gRPC port %s: %v", grpcPort, err)
+	}
+	grpcServer := grpc.NewServer()
+	pb.RegisterEtriIntegrationServiceServer(grpcServer, etri.NewGRPCServer(etriSvc))
+	log.Printf("ETRI gRPC server starting on port %s", grpcPort)
+
 	// Initialize HTTP API handler
-	apiHandler := apis.NewHandler(migrationController, autoscalingController, loadbalancingController, provisioningController, preemptionController, cachingController, insightController)
+	apiHandler := apis.NewHandler(migrationController, autoscalingController, loadbalancingController, provisioningController, preemptionController, cachingController, insightController, etriHTTPHandler)
 	router := apiHandler.SetupRoutes()
 
 	log.Printf("HTTP server starting on port %s", port)
@@ -104,17 +142,25 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start server in goroutine
+	// Start HTTP server in goroutine
 	go func() {
 		if err := router.Run(":" + port); err != nil {
 			log.Fatalf("Failed to start HTTP server: %v", err)
 		}
 	}()
 
-	log.Printf("AI Storage Orchestrator is ready to handle migration requests")
+	// Start gRPC server in goroutine
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("Failed to start gRPC server: %v", err)
+		}
+	}()
+
+	log.Printf("AI Storage Orchestrator is ready to handle HTTP and gRPC requests")
 
 	// Wait for interrupt signal
 	<-quit
 	log.Println("Shutting down AI Storage Orchestrator...")
+	grpcServer.GracefulStop()
 	log.Println("Graceful shutdown completed")
 }

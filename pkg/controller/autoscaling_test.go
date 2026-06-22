@@ -21,14 +21,90 @@ func (m *MockK8sClient) GetWorkloadReplicas(ctx context.Context, namespace, name
 	return args.Get(0).(int32), args.Error(1)
 }
 
-func (m *MockK8sClient) GetWorkloadPodMetrics(ctx context.Context, namespace, workloadName string) (cpuPercent, memoryPercent, gpuPercent int32, err error) {
-	args := m.Called(ctx, namespace, workloadName)
-	return args.Get(0).(int32), args.Get(1).(int32), args.Get(2).(int32), args.Error(3)
+// GetWorkloadPodMetrics 는 K8sClientInterface 변경(스토리지 I/O 메트릭 추가)에 맞춰
+// 6개 반환값 시그니처를 따른다. 기본 stub 은 m.Called 미설정 시 0 값을 돌려준다.
+func (m *MockK8sClient) GetWorkloadPodMetrics(ctx context.Context, namespace, workloadName string) (cpuPercent, memoryPercent, gpuPercent int32, storageReadMBps, storageWriteMBps, storageIOPS int64, err error) {
+	return 0, 0, 0, 0, 0, 0, nil
 }
 
 func (m *MockK8sClient) ScaleWorkload(ctx context.Context, namespace, name, workloadType string, replicas int32) error {
 	args := m.Called(ctx, namespace, name, workloadType, replicas)
 	return args.Error(0)
+}
+
+func (m *MockK8sClient) CreateBindingPodForPVC(ctx context.Context, namespace, pvcName, podName string) error {
+	args := m.Called(ctx, namespace, pvcName, podName)
+	return args.Error(0)
+}
+
+func (m *MockK8sClient) CreatePVCWithAnnotations(ctx context.Context, namespace, name, size, storageClass, accessMode string, labels, annotations map[string]string) error {
+	args := m.Called(ctx, namespace, name, size, storageClass, accessMode, labels, annotations)
+	return args.Error(0)
+}
+
+// --- 아래는 K8sClientInterface 를 충족시키기 위한 stub 들 ---
+// WHY: 워킹트리에서 인터페이스가 확장됐으나 MockK8sClient 가 갱신되지 않아 controller
+//      테스트 패키지가 컴파일되지 않았다. 기존 테스트(autoscaling/provisioning)는 이
+//      메서드들을 호출하지 않으므로 0 값/빈 값을 돌려주는 단순 stub 으로 충분하다.
+
+func (m *MockK8sClient) ListNodes(ctx context.Context) ([]string, error) {
+	return nil, nil
+}
+
+func (m *MockK8sClient) GetNodeMetrics(ctx context.Context, nodeName string) (cpuPercent, memoryPercent int32, err error) {
+	return 0, 0, nil
+}
+
+func (m *MockK8sClient) GetNodeCapacity(ctx context.Context, nodeName string) (cpuCapacity, memoryCapacity string, gpuCapacity int32, err error) {
+	return "", "", 0, nil
+}
+
+func (m *MockK8sClient) GetNodePodCount(ctx context.Context, nodeName string) (int32, error) {
+	return 0, nil
+}
+
+func (m *MockK8sClient) GetNodeLabel(ctx context.Context, nodeName string, labelKey string) (string, error) {
+	return "", nil
+}
+
+func (m *MockK8sClient) GetNodeGPUUtilization(ctx context.Context, nodeName string) (int32, error) {
+	return 0, nil
+}
+
+func (m *MockK8sClient) ListPodsOnNode(ctx context.Context, nodeName string) ([]types.PodRef, error) {
+	return nil, nil
+}
+
+func (m *MockK8sClient) GetNodeStorageMetrics(ctx context.Context, nodeName string) (readMBps, writeMBps, iops int64, utilization int32, err error) {
+	return 0, 0, 0, 0, nil
+}
+
+func (m *MockK8sClient) CreatePVC(ctx context.Context, namespace, name, size, storageClass, accessMode string, labels map[string]string) error {
+	return nil
+}
+
+func (m *MockK8sClient) DeletePod(ctx context.Context, namespace, name string) error {
+	return nil
+}
+
+func (m *MockK8sClient) DeletePVC(ctx context.Context, namespace, name string) error {
+	return nil
+}
+
+func (m *MockK8sClient) WaitForPVCReady(ctx context.Context, namespace, name string, timeoutSeconds int) error {
+	return nil
+}
+
+func (m *MockK8sClient) GetPodResourceInfo(ctx context.Context, namespace, name string) (*types.PodResourceInfo, error) {
+	return nil, nil
+}
+
+func (m *MockK8sClient) EvictPod(ctx context.Context, namespace, name string, gracePeriodSeconds int64) error {
+	return nil
+}
+
+func (m *MockK8sClient) RunCachePrefetchPod(ctx context.Context, namespace, pvcName, sourcePath, jobID string) (bytesLoaded int64, fileCount int64, err error) {
+	return 0, 0, nil
 }
 
 // TestCreateAutoscaler tests the creation of an autoscaler
@@ -122,7 +198,7 @@ func TestCreateAutoscalerValidation(t *testing.T) {
 				MinReplicas:       1,
 				MaxReplicas:       5,
 			},
-			expectedErr: "at least one target metric (CPU, Memory, or GPU) must be specified",
+			expectedErr: "at least one target metric (CPU, Memory, GPU, or Storage I/O) must be specified",
 		},
 	}
 
@@ -295,7 +371,8 @@ func TestCalculateDesiredReplicas(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := ac.calculateDesiredReplicas(tt.job, tt.cpuUtil, tt.memUtil, tt.gpuUtil)
+			// 스토리지 I/O 메트릭은 0 으로 전달해 기존 CPU/메모리 기반 기대값을 유지한다.
+			result := ac.calculateDesiredReplicas(tt.job, tt.cpuUtil, tt.memUtil, tt.gpuUtil, 0, 0, 0)
 			assert.Equal(t, tt.expectedReplicas, result)
 		})
 	}
@@ -474,7 +551,7 @@ func TestMaxScaleChange(t *testing.T) {
 		}
 
 		// CPU suggests scaling to 10 replicas
-		result := ac.calculateDesiredReplicas(job, 350, 0, 0)
+		result := ac.calculateDesiredReplicas(job, 350, 0, 0, 0, 0, 0)
 		// Should be limited to current + 3 = 5
 		assert.LessOrEqual(t, result, int32(5))
 	})
@@ -495,7 +572,7 @@ func TestMaxScaleChange(t *testing.T) {
 		}
 
 		// CPU suggests scaling to 1 replica
-		result := ac.calculateDesiredReplicas(job, 7, 0, 0)
+		result := ac.calculateDesiredReplicas(job, 7, 0, 0, 0, 0, 0)
 		// Should be limited to current - 2 = 8
 		assert.GreaterOrEqual(t, result, int32(8))
 	})

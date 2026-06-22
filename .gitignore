@@ -46,3 +46,8 @@ CLAUDE.md
 
 # API Documentation
 docs/
+.tmp-go/
+__pycache__/
+.venv/
+/main
+/policy-agent

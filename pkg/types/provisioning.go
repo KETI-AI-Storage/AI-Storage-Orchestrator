@@ -8,10 +8,12 @@ type ProvisioningRequest struct {
 	WorkloadName      string `json:"workload_name" binding:"required"`
 	WorkloadNamespace string `json:"workload_namespace" binding:"required"`
 	WorkloadType      string `json:"workload_type" binding:"required"` // training, inference, data-pipeline
+	RunID             string `json:"run_id,omitempty"`
+	TargetStage       string `json:"target_stage,omitempty"`
 
 	// Storage requirements
 	StorageSize         string `json:"storage_size,omitempty"`          // e.g., "500Gi", "1Ti"
-	StorageClass        string `json:"storage_class,omitempty"`         // e.g., "high-throughput", "high-iops", "balanced"
+	StorageClass        string `json:"storage_class,omitempty"`         // tier: L1, L2, L3, S3 (legacy burst/cache/performance/capacity/archive 호환)
 	AccessMode          string `json:"access_mode,omitempty"`           // ReadWriteOnce, ReadWriteMany, ReadOnlyMany
 	AutoSize            bool   `json:"auto_size,omitempty"`             // Automatically determine size based on workload type
 

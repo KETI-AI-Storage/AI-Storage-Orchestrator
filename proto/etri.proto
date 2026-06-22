@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package etri.v1;
+
+option go_package = "ai-storage-orchestrator/pkg/etri/pb;pb";
+
+// ETRI ↔ KETI integration service definition.
+service EtriIntegrationService {
+  // Register workload metadata and execution intent.
+  rpc RegisterWorkloadMetadata (RegisterWorkloadMetadataRequest) returns (RegisterWorkloadMetadataResponse);
+
+  // Query workload status.
+  rpc GetWorkloadStatus (WorkloadStatusRequest) returns (WorkloadStatusResponse);
+
+  // (Optional in this phase) Report final workload result back to KETI.
+  rpc ReportWorkloadResult (ReportWorkloadResultRequest) returns (ReportWorkloadResultResponse);
+
+  // (Optional) Resolve dataset logical reference to internal binding information.
+  rpc GetDatasetBindingInfo (GetDatasetBindingInfoRequest) returns (GetDatasetBindingInfoResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+message EtriWorkloadMetadata {
+  string workload_name = 1;
+  string namespace = 2;
+  string job_type = 3;
+  string stage = 4;      // preprocess / train / inference
+  string framework = 5;  // kubeflow / kueue / pod / etc.
+  string pipeline_id = 6;
+
+  map<string, string> labels = 7;
+  map<string, string> annotations = 8;
+
+  repeated DatasetReference datasets = 9;
+  ExecutionRequirement execution = 10;
+  SchedulingHint scheduling = 11;
+  OrchestrationHint orchestration = 12;
+}
+
+message DatasetReference {
+  string dataset_name = 1;
+  string dataset_id = 2;
+  string logical_path = 3;
+  string access_pattern = 4; // read / write / mixed / sequential / random
+  bool cache_preferred = 5;
+  bool local_first = 6;
+  int64 approx_size_bytes = 7;
+  int64 file_count = 8;
+  map<string, string> labels = 9;
+  map<string, string> annotations = 10;
+}
+
+message ExecutionRequirement {
+  int32 gpu_count = 1;
+  string cpu = 2;
+  string memory = 3;
+  bool distributed = 4;
+  string priority_class_name = 5;
+  string qos_class = 6;
+}
+
+message SchedulingHint {
+  string locality_preference = 1; // HIGH / LOW / CACHE
+  bool prefer_csd = 2;
+  bool prefer_gpu = 3;
+  map<string, string> additional_labels = 4;
+  map<string, string> additional_annotations = 5;
+}
+
+message OrchestrationHint {
+  bool enable_migration = 1;
+  bool enable_checkpoint = 2;
+  bool enable_global_cache = 3;
+  string strategy = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Register workload metadata
+// ---------------------------------------------------------------------------
+
+message RegisterWorkloadMetadataRequest {
+  EtriWorkloadMetadata metadata = 1;
+}
+
+message RegisterWorkloadMetadataResponse {
+  string workload_name = 1;
+  string namespace = 2;
+  string message = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Workload status
+// ---------------------------------------------------------------------------
+
+message WorkloadStatusRequest {
+  string workload_name = 1;
+  string namespace = 2;
+}
+
+message WorkloadStatusResponse {
+  string workload_name = 1;
+  string namespace = 2;
+  string phase = 3; // Pending / Running / Failed / Succeeded / Unknown
+  string node_name = 4;
+  string locality = 5;
+  string dataset_name = 6;
+  string message = 7;
+  int64 last_transition_time_unix_seconds = 8;
+  map<string, string> labels = 9;
+  map<string, string> annotations = 10;
+}
+
+// ---------------------------------------------------------------------------
+// Report workload result
+// ---------------------------------------------------------------------------
+
+message ReportWorkloadResultRequest {
+  WorkloadStatusResponse status = 1;
+}
+
+message ReportWorkloadResultResponse {
+  string message = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Dataset binding info (logical → internal)
+// ---------------------------------------------------------------------------
+
+message GetDatasetBindingInfoRequest {
+  string dataset_name = 1;
+  string namespace = 2;
+}
+
+message GetDatasetBindingInfoResponse {
+  string dataset_name = 1;
+  string namespace = 2;
+
+  // High-level description of how this dataset is bound (PVC/PV/storageClass, etc.).
+  // Concrete CSI / PV path details remain internal to KETI/Gluesys.
+  string binding_description = 3;
+}
+

@@ -1,10 +1,15 @@
 package apis
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 
 	"ai-storage-orchestrator/pkg/controller"
+	"ai-storage-orchestrator/pkg/etri"
+	"ai-storage-orchestrator/pkg/k8s"
 	"ai-storage-orchestrator/pkg/types"
 
 	"github.com/gin-gonic/gin"
@@ -19,10 +24,11 @@ type Handler struct {
 	preemptionController    *controller.PreemptionController
 	cachingController       *controller.CachingController
 	insightController       *controller.InsightController
+	etriHTTPHandler         *etri.HTTPHandler
 }
 
 // NewHandler creates a new API handler
-func NewHandler(migrationController *controller.MigrationController, autoscalingController *controller.AutoscalingController, loadbalancingController *controller.LoadbalancingController, provisioningController *controller.ProvisioningController, preemptionController *controller.PreemptionController, cachingController *controller.CachingController, insightController *controller.InsightController) *Handler {
+func NewHandler(migrationController *controller.MigrationController, autoscalingController *controller.AutoscalingController, loadbalancingController *controller.LoadbalancingController, provisioningController *controller.ProvisioningController, preemptionController *controller.PreemptionController, cachingController *controller.CachingController, insightController *controller.InsightController, etriHTTPHandler *etri.HTTPHandler) *Handler {
 	return &Handler{
 		migrationController:     migrationController,
 		autoscalingController:   autoscalingController,
@@ -31,13 +37,14 @@ func NewHandler(migrationController *controller.MigrationController, autoscaling
 		preemptionController:    preemptionController,
 		cachingController:       cachingController,
 		insightController:       insightController,
+		etriHTTPHandler:         etriHTTPHandler,
 	}
 }
 
 // SetupRoutes configures the HTTP routes
 func (h *Handler) SetupRoutes() *gin.Engine {
 	router := gin.Default()
-	
+
 	// Add middleware
 	router.Use(gin.Logger())
 	router.Use(gin.Recovery())
@@ -52,6 +59,7 @@ func (h *Handler) SetupRoutes() *gin.Engine {
 		v1.POST("/migrations", h.createMigration)
 		v1.GET("/migrations/:id", h.getMigration)
 		v1.GET("/migrations/:id/status", h.getMigrationStatus)
+		v1.GET("/stage-execution-plans", h.getStageExecutionPlan)
 		v1.GET("/metrics", h.getMetrics)
 
 		// Autoscaling API endpoints
@@ -98,6 +106,12 @@ func (h *Handler) SetupRoutes() *gin.Engine {
 		v1.GET("/insight/signatures", h.listInsightSignatures)
 		v1.GET("/insight/signatures/:namespace/:name", h.getInsightSignature)
 		v1.GET("/insight/metrics", h.getInsightMetrics)
+
+		// ETRI integration endpoints (external interface)
+		etriGroup := v1.Group("/etri")
+		if h.etriHTTPHandler != nil {
+			h.etriHTTPHandler.RegisterRoutes(etriGroup)
+		}
 	}
 
 	return router
@@ -115,7 +129,7 @@ func (h *Handler) healthCheck(c *gin.Context) {
 // createMigration handles POST /api/v1/migrations
 func (h *Handler) createMigration(c *gin.Context) {
 	var req types.MigrationRequest
-	
+
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   "Invalid request format",
@@ -141,6 +155,16 @@ func (h *Handler) createMigration(c *gin.Context) {
 	// Start migration
 	response, err := h.migrationController.StartMigration(&req)
 	if err != nil {
+		var waitingErr *k8s.WaitingForTargetError
+		if errors.As(err, &waitingErr) {
+			c.JSON(http.StatusTooEarly, gin.H{
+				"error":      "Target is not ready yet",
+				"error_code": "WaitingForTarget",
+				"status":     "waiting_for_target",
+				"details":    err.Error(),
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "Failed to start migration",
 			"details": err.Error(),
@@ -154,7 +178,7 @@ func (h *Handler) createMigration(c *gin.Context) {
 // getMigration handles GET /api/v1/migrations/:id
 func (h *Handler) getMigration(c *gin.Context) {
 	migrationID := c.Param("id")
-	
+
 	response, err := h.migrationController.GetMigrationStatus(migrationID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
@@ -170,7 +194,7 @@ func (h *Handler) getMigration(c *gin.Context) {
 // getMigrationStatus handles GET /api/v1/migrations/:id/status
 func (h *Handler) getMigrationStatus(c *gin.Context) {
 	migrationID := c.Param("id")
-	
+
 	response, err := h.migrationController.GetMigrationStatus(migrationID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
@@ -207,28 +231,59 @@ func (h *Handler) getMetrics(c *gin.Context) {
 	c.JSON(http.StatusOK, metrics)
 }
 
+// getStageExecutionPlan handles GET /api/v1/stage-execution-plans?run_id=...&target_stage=...
+func (h *Handler) getStageExecutionPlan(c *gin.Context) {
+	runID := c.Query("run_id")
+	targetStage := c.Query("target_stage")
+	if runID == "" || targetStage == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "run_id and target_stage are required",
+		})
+		return
+	}
+	plan, err := h.migrationController.GetStageExecutionPlan(runID, targetStage)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "StageExecutionPlan not found",
+			"details": err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, plan)
+}
+
 // validateMigrationRequest validates the migration request
 func (h *Handler) validateMigrationRequest(req *types.MigrationRequest) error {
-	if req.PodName == "" {
-		return fmt.Errorf("pod_name is required")
-	}
-	if req.PodNamespace == "" {
-		return fmt.Errorf("pod_namespace is required")
-	}
-	if req.SourceNode == "" {
-		return fmt.Errorf("source_node is required")
+	hasPodPair := strings.TrimSpace(req.PodName) != "" && strings.TrimSpace(req.PodNamespace) != ""
+	hasWorkloadPair := strings.TrimSpace(req.WorkloadName) != "" && strings.TrimSpace(req.WorkloadNamespace) != ""
+	if !hasPodPair && !hasWorkloadPair {
+		return fmt.Errorf("either pod_name+pod_namespace or workload_name+workload_namespace is required")
 	}
 	if req.TargetNode == "" {
 		return fmt.Errorf("target_node is required")
 	}
-	if req.SourceNode == req.TargetNode {
-		return fmt.Errorf("source_node and target_node cannot be the same")
+	if strings.TrimSpace(req.SourceNode) != "" && req.SourceNode == req.TargetNode {
+		// WHY: 단일 노드 데모 클러스터에서는 교체 대상 노드가 없어 파이프라인 검증만
+		//      same-node 로 수행한다. 운영 환경에서는 기본적으로 금지한다.
+		if !allowSameNodeMigration() {
+			return fmt.Errorf("source_node and target_node cannot be the same")
+		}
 	}
 	if req.Timeout < 0 {
 		return fmt.Errorf("timeout must be non-negative")
 	}
-	
+
 	return nil
+}
+
+// allowSameNodeMigration은 단일 노드 데모에서 migration 파이프라인 검증을 허용한다.
+func allowSameNodeMigration() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ALLOW_SAME_NODE_MIGRATION"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // createAutoscaler handles POST /api/v1/autoscaling
@@ -285,7 +340,7 @@ func (h *Handler) deleteAutoscaler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "Autoscaler deleted successfully",
+		"message":       "Autoscaler deleted successfully",
 		"autoscaler_id": autoscalerID,
 	})
 }
@@ -408,6 +463,7 @@ func (h *Handler) getLoadbalancingMetrics(c *gin.Context) {
 	metrics := h.loadbalancingController.GetMetrics()
 	c.JSON(http.StatusOK, metrics)
 }
+
 // ========================================
 // Provisioning API Handlers
 // ========================================

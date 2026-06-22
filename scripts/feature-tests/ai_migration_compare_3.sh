@@ -8,6 +8,9 @@ readonly VERSION="1.0.0"
 readonly TEST_ID="AI-MIGRATION-$(date +%Y%m%d%H%M%S)"
 readonly TEST_NAMESPACE="ai-test-$(date +%s)"
 readonly AI_POD_NAME="tensorflow-ai-workload"
+# ai_migration_compare.sh 와 동일한 3컨테이너 스펙이되, 최초 스케줄만 커스텀 스케줄러가 담당.
+readonly AI_STORAGE_SCHEDULER_NAME="ai-storage-scheduler"
+readonly AI_STORAGE_SCHEDULER_NS="${AI_STORAGE_SCHEDULER_NS:-keti}"
 
 # Global variables for measurements
 declare -g K8S_MIGRATION_TIME=0
@@ -45,7 +48,7 @@ log_error() {
 
 print_header() {
     echo "================================================================="
-    echo "     AI Container Migration Performance Comparison Tool"
+    echo "  AI Container Migration Performance Comparison (scheduler: ${AI_STORAGE_SCHEDULER_NAME})"
     echo "================================================================="
     echo "Test ID: $TEST_ID"
     echo "Date: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -202,11 +205,24 @@ wait_for_pod_ready() {
     fi
 }
 
+ensure_ai_storage_scheduler() {
+    # 커스텀 스케줄러가 없으면 schedulerName 지정 Pod가 영구 Pending 될 수 있음.
+    if ! kubectl get deployment ai-storage-scheduler -n "$AI_STORAGE_SCHEDULER_NS" >/dev/null 2>&1; then
+        echo "✗ 네임스페이스 '${AI_STORAGE_SCHEDULER_NS}' 에 ai-storage-scheduler Deployment 가 없습니다."
+        echo "  예: kubectl apply -f ai-storage-scheduler/deployments/ai-storage-scheduler.yaml"
+        echo "  다른 네임스페이스에 두었다면 환경변수 AI_STORAGE_SCHEDULER_NS 를 맞춰 주세요."
+        exit 1
+    fi
+    log_info "Custom scheduler ready: ${AI_STORAGE_SCHEDULER_NS}/ai-storage-scheduler"
+}
+
 setup_test_environment() {
     echo "• Setting up test environment..."
     
     kubectl create namespace "$TEST_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1
     
+    ensure_ai_storage_scheduler
+
     if ! kubectl get deployment ai-storage-orchestrator -n kube-system >/dev/null 2>&1; then
         echo "• Deploying AI Storage Orchestrator..."
         # 스크립트 위치 기준으로 리포 루트(ai-storage-orchestrator/)를 찾음(하드코딩 경로 제거).
@@ -234,6 +250,7 @@ metadata:
     app: tensorflow-ai-benchmark
     workload-type: ai-training
 spec:
+  schedulerName: ${AI_STORAGE_SCHEDULER_NAME}
   containers:
   - name: tensorflow-trainer
     image: tensorflow/tensorflow:2.13.0
@@ -613,12 +630,15 @@ main() {
                 ;;
             -h|--help)
                 echo "Usage: $0 [--source-node <node>] [--target-node <node>]"
-                echo "AI Container Migration Performance Comparison Tool"
+                echo "AI Container Migration Performance Comparison (동일 3컨테이너, schedulerName=${AI_STORAGE_SCHEDULER_NAME})"
                 echo ""
                 echo "Options:"
                 echo "  --source-node    Initial node for AI workload"
                 echo "  --target-node    Target node for migration test"
                 echo "  -h, --help       Show this help message"
+                echo ""
+                echo "Environment:"
+                echo "  AI_STORAGE_SCHEDULER_NS   스케줄러 Deployment 네임스페이스 (기본: keti)"
                 exit 0
                 ;;
             *)

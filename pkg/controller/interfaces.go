@@ -25,7 +25,18 @@ type K8sClientInterface interface {
 	// Storage I/O operations for AI/ML workloads
 	GetNodeStorageMetrics(ctx context.Context, nodeName string) (readMBps, writeMBps, iops int64, utilization int32, err error)
 
+	// Provisioning operations
+	CreatePVC(ctx context.Context, namespace, name, size, storageClass, accessMode string, labels map[string]string) error
+	CreatePVCWithAnnotations(ctx context.Context, namespace, name, size, storageClass, accessMode string, labels, annotations map[string]string) error
+	CreateBindingPodForPVC(ctx context.Context, namespace, pvcName, podName string) error
+	DeletePod(ctx context.Context, namespace, name string) error
+	DeletePVC(ctx context.Context, namespace, name string) error
+	WaitForPVCReady(ctx context.Context, namespace, name string, timeoutSeconds int) error
+
 	// Preemption operations
 	GetPodResourceInfo(ctx context.Context, namespace, name string) (*types.PodResourceInfo, error)
 	EvictPod(ctx context.Context, namespace, name string, gracePeriodSeconds int64) error
+
+	// Caching operations
+	RunCachePrefetchPod(ctx context.Context, namespace, pvcName, sourcePath, jobID string) (bytesLoaded int64, fileCount int64, err error)
 }

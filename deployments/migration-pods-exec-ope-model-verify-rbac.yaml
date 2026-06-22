@@ -1,0 +1,37 @@
+# AI Storage Orchestrator — migration output stage: 대상 namespace Pod에 kubectl exec(= pods/exec) 허용
+# ServiceAccount: kube-system/ai-storage-orchestrator (cluster-orchestrator.yaml)
+#
+# 대상: Orchestrator가 targetNamespace(예: ope-model-verify)의 마이그레이션 Pod에 exec하여
+#       _SUCCESS 등 output stage를 수행할 수 있게 한다.
+# 다른 namespace에서 마이그레이션 시 이와 동일한 Role+RoleBinding을 해당 namespace에 복제해 적용한다.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ai-storage-orchestrator-migration-pods-exec
+  namespace: ope-model-verify
+  labels:
+    app: ai-storage-orchestrator
+    component: migration-exec
+rules:
+  # output stage: Pod 내부에 파일 생성/명령 실행 (최소: subresource exec만)
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ai-storage-orchestrator-migration-pods-exec
+  namespace: ope-model-verify
+  labels:
+    app: ai-storage-orchestrator
+    component: migration-exec
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ai-storage-orchestrator-migration-pods-exec
+subjects:
+  - kind: ServiceAccount
+    name: ai-storage-orchestrator
+    namespace: kube-system

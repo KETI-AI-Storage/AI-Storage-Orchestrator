@@ -34,7 +34,7 @@ type LoadbalancingJob struct {
 	cancel      context.CancelFunc
 }
 
-// NewLoadbalancingController creates a new loadbalancing controller
+// NewLoadbalancingController creates a new loadbalancing controller.
 func NewLoadbalancingController(k8sClient K8sClientInterface, migrationController *MigrationController) *LoadbalancingController {
 	return &LoadbalancingController{
 		k8sClient:          k8sClient,
@@ -100,6 +100,8 @@ func (lc *LoadbalancingController) validateRequest(req *types.LoadbalancingReque
 		string(types.StrategyWeighted),
 		string(types.LBStrategyStorageIOBalanced),
 		string(types.LBStrategyStorageAwareWeighted),
+		// WHY: 노드별 Pod 개수 편차로 imbalance 를 판정하는 demo-friendly strategy.
+		string(types.StrategyPodCount),
 	}
 	isValid := false
 	for _, s := range validStrategies {
@@ -469,9 +471,147 @@ func (lc *LoadbalancingController) calculateMigrationPlan(job *LoadbalancingJob,
 		return lc.calculateStorageIOBalancedPlan(job, state)
 	case types.LBStrategyStorageAwareWeighted:
 		return lc.calculateStorageAwareWeightedPlan(job, state)
+	case types.StrategyPodCount:
+		return lc.calculatePodCountPlan(job, state)
 	default:
 		return nil, fmt.Errorf("unsupported strategy: %s", strategy)
 	}
+}
+
+// calculatePodCountPlan 는 노드별 Pod 개수 편차만으로 migration plan 을 생성한다.
+//
+// WHY: 데모 환경처럼 노드 CPU/Memory 사용률이 모두 낮은 경우 기존 strategy 들은 모두
+//
+//	"Cluster is already balanced" 로 판정해 migration 이 발생하지 않는다. Pod 개수
+//	편차를 직접 본다.
+//
+// 동작:
+//
+//  1. job.Request.Namespace 가 비어 있지 않으면 해당 namespace 의 Pod 만, 비어 있으면
+//     모든 Pod 을 노드별로 카운트한다.
+//  2. 평균 대비 +1 초과 노드(source) 와 평균 미만 노드(target) 를 추려 source 의 Pod 을
+//     target 으로 옮기는 plan 을 만든다.
+//  3. MaxMigrationsPerCycle 으로 상한을 둔다(없으면 1).
+func (lc *LoadbalancingController) calculatePodCountPlan(job *LoadbalancingJob, state *types.ClusterState) ([]types.MigrationPlan, error) {
+	ctx := context.Background()
+	plan := make([]types.MigrationPlan, 0)
+
+	if len(state.Nodes) < 2 {
+		return plan, nil
+	}
+
+	type nodeCount struct {
+		Name  string
+		Count int32
+	}
+	per := make([]nodeCount, 0, len(state.Nodes))
+	totalCount := int32(0)
+	for _, n := range state.Nodes {
+		// Pod 카운트는 namespace 필터를 반영해 다시 계산한다.
+		pods, err := lc.k8sClient.ListPodsOnNode(ctx, n.NodeName)
+		if err != nil {
+			log.Printf("[pod_count] WARN list pods failed for node %s: %v", n.NodeName, err)
+			continue
+		}
+		cnt := int32(0)
+		for _, p := range pods {
+			if job.Request.Namespace != "" && p.Namespace != job.Request.Namespace {
+				continue
+			}
+			cnt++
+		}
+		per = append(per, nodeCount{Name: n.NodeName, Count: cnt})
+		totalCount += cnt
+	}
+
+	if len(per) < 2 || totalCount == 0 {
+		return plan, nil
+	}
+	mean := float64(totalCount) / float64(len(per))
+
+	// 정렬: source 후보(많은 순), target 후보(적은 순)
+	sort.Slice(per, func(i, j int) bool { return per[i].Count > per[j].Count })
+
+	// imbalance 임계 = max(1, ceil(mean*0.5)). namespace 가 비어 있는 cluster-wide
+	// 모드는 자연 편차가 크므로 임계를 ceil(mean*0.5) 로 두고, namespace 한정 모드는
+	// 작은 차이도 잡도록 1 로 한다.
+	threshold := int32(1)
+	if job.Request.Namespace == "" {
+		// cluster-wide: 50% 편차 이상만 imbalance 로 본다.
+		t := int32(math.Ceil(mean * 0.5))
+		if t > threshold {
+			threshold = t
+		}
+	}
+
+	maxMig := job.Request.MaxMigrationsPerCycle
+	if maxMig <= 0 {
+		maxMig = 1
+	}
+
+	// target 후보는 적은 쪽부터
+	targets := make([]nodeCount, len(per))
+	copy(targets, per)
+	sort.Slice(targets, func(i, j int) bool { return targets[i].Count < targets[j].Count })
+
+	migCount := int32(0)
+	for _, src := range per {
+		if migCount >= maxMig {
+			break
+		}
+		// imbalance 임계 미달 source 는 skip
+		if float64(src.Count) <= mean+float64(threshold-1) {
+			continue
+		}
+
+		// 적합한 target 선정: src 와 다른 노드 중 가장 Pod 적은 노드
+		var tgt string
+		for _, t := range targets {
+			if t.Name == src.Name {
+				continue
+			}
+			tgt = t.Name
+			break
+		}
+		if tgt == "" {
+			continue
+		}
+
+		// 실제 옮길 Pod 선정: src 노드의 namespace-매칭 Pod 중 하나
+		pods, err := lc.k8sClient.ListPodsOnNode(ctx, src.Name)
+		if err != nil {
+			continue
+		}
+		var pickedPod *types.PodRef
+		for i := range pods {
+			p := pods[i]
+			if job.Request.Namespace != "" && p.Namespace != job.Request.Namespace {
+				continue
+			}
+			// system/control 컴포넌트는 회피한다.
+			if p.Namespace == "kube-system" || p.Namespace == "apollo" {
+				continue
+			}
+			pickedPod = &p
+			break
+		}
+		if pickedPod == nil {
+			continue
+		}
+
+		plan = append(plan, types.MigrationPlan{
+			PodName:      pickedPod.Name,
+			PodNamespace: pickedPod.Namespace,
+			SourceNode:   src.Name,
+			TargetNode:   tgt,
+			Reason: fmt.Sprintf("pod_count imbalance: source=%s has %d pods, target=%s has fewest, mean=%.1f, threshold=%d",
+				src.Name, src.Count, tgt, mean, threshold),
+			Priority: int32(100 - migCount),
+		})
+		migCount++
+	}
+
+	return plan, nil
 }
 
 // calculateLoadSpreadingPlan calculates a plan to spread load evenly across nodes

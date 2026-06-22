@@ -1,0 +1,33 @@
+# 선택: 오케스트레이터 자체에 HPA 가 필요할 때만 적용한다.
+# 기본은 비적용 권장 — replica>1 시 마이그레이션/포트포워드 시 Pod 가 번갈아 보이는 문제가 생길 수 있다.
+#
+# Author: 미정
+# Created: 2026-04-13
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ai-storage-orchestrator-hpa
+  namespace: kube-system
+  labels:
+    app: ai-storage-orchestrator
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ai-storage-orchestrator
+  minReplicas: 1
+  maxReplicas: 1
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
