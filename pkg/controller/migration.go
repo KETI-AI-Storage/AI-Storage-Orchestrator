@@ -608,37 +608,31 @@ func (mc *MigrationController) collectPostMigrationMetrics(job *MigrationJob) er
 	// Wait a bit for metrics to stabilize
 	time.Sleep(30 * time.Second)
 
-	// Collect actual metrics from the new pod
-	if job.Details.NewPodName != "" {
-		metrics, err := mc.k8sClient.GetPodMetrics(job.ctx, job.Request.PodNamespace, job.Details.NewPodName)
-		if err != nil {
-			log.Printf("Warning: Failed to collect optimized pod metrics: %v", err)
-			// Fallback to simulation if metrics collection fails
-			if job.Details.OriginalResources != nil {
-				job.Details.OptimizedResources = &types.ResourceUsage{
-					CPUUsage:    job.Details.OriginalResources.CPUUsage * 0.5,
-					MemoryUsage: int64(float64(job.Details.OriginalResources.MemoryUsage) * 0.6),
-					Timestamp:   time.Now(),
-				}
-			}
-			return nil
-		}
-		job.Details.OptimizedResources = metrics
-		log.Printf("Migration %s: Collected optimized metrics - CPU: %.2f cores, Memory: %d bytes",
-			job.ID, metrics.CPUUsage, metrics.MemoryUsage)
-	} else {
-		// Fallback: if new pod name is not available, use simulation
-		log.Printf("Warning: New pod name not available, using simulated metrics")
-		if job.Details.OriginalResources != nil {
-			job.Details.OptimizedResources = &types.ResourceUsage{
-				CPUUsage:    job.Details.OriginalResources.CPUUsage * 0.5,
-				MemoryUsage: int64(float64(job.Details.OriginalResources.MemoryUsage) * 0.6),
-				Timestamp:   time.Now(),
-			}
-		}
+	if job.Details.NewPodName == "" {
+		mc.applyOptimizedMetrics(job, nil, fmt.Errorf("new pod name not available"))
+		return nil
 	}
 
+	metrics, err := mc.k8sClient.GetPodMetrics(job.ctx, job.Request.PodNamespace, job.Details.NewPodName)
+	mc.applyOptimizedMetrics(job, metrics, err)
 	return nil
+}
+
+// applyOptimizedMetrics records the optimized pod's measured resource usage on the job.
+// If measurement is unavailable, OptimizedResources is left nil so that savings are
+// reported as unmeasured rather than fabricated.
+func (mc *MigrationController) applyOptimizedMetrics(job *MigrationJob, metrics *types.ResourceUsage, err error) {
+	if err != nil || metrics == nil {
+		// Measurement unavailable: leave OptimizedResources nil so that resource savings
+		// are reported as unmeasured rather than fabricated. (This previously synthesized a
+		// 50% CPU / 60% memory figure from the original usage, which misrepresented the
+		// result whenever metrics-server was unavailable.)
+		log.Printf("Migration %s: optimized pod metrics unavailable; savings left unmeasured (%v)", job.ID, err)
+		return
+	}
+	job.Details.OptimizedResources = metrics
+	log.Printf("Migration %s: Collected optimized metrics - CPU: %.2f cores, Memory: %d bytes",
+		job.ID, metrics.CPUUsage, metrics.MemoryUsage)
 }
 
 // Helper methods
