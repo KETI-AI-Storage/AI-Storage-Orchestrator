@@ -384,8 +384,21 @@ func buildOptimizedPodSpec(originalPod *corev1.Pod, targetNode string, container
 	newPod.Labels["migration.ai-storage/target-node"] = targetNode
 	newPod.Labels["migration.ai-storage/job"] = "true"
 
-	// Set node selector for target node
+	// Pin to the chosen target node. NodeName is authoritative and bypasses the
+	// scheduler, so any node-placement constraints inherited from the source pod
+	// can only make the *target* kubelet reject the migrated pod with a
+	// NodeAffinity/selector mismatch (they pin to the source node) — they can never
+	// help, since NodeName already fixes placement. Strip them. Capability remains
+	// enforced by the pod's resource requests, and Tolerations are kept (untouched)
+	// so target-node taints are still tolerated.
 	newPod.Spec.NodeName = targetNode
+	newPod.Spec.NodeSelector = nil
+	if newPod.Spec.Affinity != nil {
+		newPod.Spec.Affinity.NodeAffinity = nil
+		if newPod.Spec.Affinity.PodAffinity == nil && newPod.Spec.Affinity.PodAntiAffinity == nil {
+			newPod.Spec.Affinity = nil
+		}
+	}
 
 	// Filter containers - only include those that should be migrated
 	var optimizedContainers []corev1.Container

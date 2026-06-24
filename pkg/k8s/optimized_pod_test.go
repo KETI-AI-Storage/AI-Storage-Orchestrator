@@ -62,6 +62,58 @@ func TestBuildOptimizedPodSpec_ExcludesCompletedContainers(t *testing.T) {
 	}
 }
 
+// TestBuildOptimizedPodSpec_StripsNodePlacementConstraints locks in the relocation
+// fix (#15): a forced migration sets Spec.NodeName to the chosen target, which
+// bypasses the scheduler. Node-placement constraints inherited from the source pod
+// (NodeSelector — including the kubernetes.io/hostname pin — and NodeAffinity) can
+// then ONLY make the target kubelet reject the pod with a NodeAffinity/selector
+// mismatch; they can never help, since NodeName already fixes placement. So they
+// must be stripped. Capability is still enforced by the pod's resource requests,
+// and tolerations are kept so target-node taints are still tolerated.
+func TestBuildOptimizedPodSpec_StripsNodePlacementConstraints(t *testing.T) {
+	original := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pinned", Namespace: "ai-storage-workloads"},
+		Spec: corev1.PodSpec{
+			NodeName: "gpu-server-03",
+			NodeSelector: map[string]string{
+				corev1.LabelHostname: "gpu-server-03",
+				"nvidia.com/gpu":     "present",
+			},
+			Affinity: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+							MatchExpressions: []corev1.NodeSelectorRequirement{{
+								Key:      corev1.LabelHostname,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{"gpu-server-03"},
+							}},
+						}},
+					},
+				},
+			},
+			Tolerations: []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpExists}},
+			Containers:  []corev1.Container{{Name: "train", Image: "busybox"}},
+		},
+	}
+	states := []types.ContainerState{{Name: "train", State: "running", ShouldMigrate: true}}
+
+	opt := buildOptimizedPodSpec(original, "csd-server-01", states, "", "")
+
+	if opt.Spec.NodeName != "csd-server-01" {
+		t.Fatalf("NodeName = %q, want csd-server-01", opt.Spec.NodeName)
+	}
+	if len(opt.Spec.NodeSelector) != 0 {
+		t.Errorf("NodeSelector leaked to migrated pod: %v (must be cleared; NodeName is authoritative)", opt.Spec.NodeSelector)
+	}
+	if opt.Spec.Affinity != nil && opt.Spec.Affinity.NodeAffinity != nil {
+		t.Errorf("NodeAffinity leaked to migrated pod: %+v (pins to source node)", opt.Spec.Affinity.NodeAffinity)
+	}
+	if len(opt.Spec.Tolerations) != 1 {
+		t.Errorf("Tolerations = %v, want preserved (needed to tolerate target taints)", opt.Spec.Tolerations)
+	}
+}
+
 // TestBuildOptimizedPodSpec_NoDuplicateCheckpointVolumeOnReMigration locks in the
 // re-migration safety: migrating a pod that ALREADY carries a checkpoint-volume (i.e.
 // it is itself a prior migration product) must NOT yield a duplicate volume, which the
