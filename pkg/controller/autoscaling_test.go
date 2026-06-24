@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -471,15 +472,18 @@ func TestApplyStabilizationWindow(t *testing.T) {
 	})
 }
 
-// TestListAutoscalers tests listing all autoscalers
+// TestListAutoscalers tests listing all autoscalers. Each autoscaler is for a
+// DISTINCT workload, because #9-B idempotency (CreateAutoscaler) keeps at most one
+// active autoscaler per workload — three requests for the same workload would
+// collapse to one (see TestCreateAutoscaler_IdempotentPerWorkload).
 func TestListAutoscalers(t *testing.T) {
 	mockClient := new(MockK8sClient)
 	ac := NewAutoscalingController(mockClient)
 
-	// Create multiple autoscalers
+	// Create multiple autoscalers for distinct workloads
 	for i := 0; i < 3; i++ {
 		req := &types.AutoscalingRequest{
-			WorkloadName:      "test-deployment",
+			WorkloadName:      fmt.Sprintf("test-deployment-%d", i),
 			WorkloadNamespace: "default",
 			WorkloadType:      "Deployment",
 			MinReplicas:       1,
@@ -492,6 +496,37 @@ func TestListAutoscalers(t *testing.T) {
 
 	list := ac.ListAutoscalers()
 	assert.Equal(t, 3, len(list))
+}
+
+// TestCreateAutoscaler_IdempotentPerWorkload locks in #9-B: repeated
+// CreateAutoscaler calls for the SAME workload must not stack autoscalers; the
+// existing active one is reused. Stacking caused multiple autoscalers to fight
+// over the same workload's replicas and leaked monitoring goroutines (rate-limit
+// runaway). Previously only covered by the live E2E harness.
+func TestCreateAutoscaler_IdempotentPerWorkload(t *testing.T) {
+	mockClient := new(MockK8sClient)
+	ac := NewAutoscalingController(mockClient)
+
+	req := &types.AutoscalingRequest{
+		WorkloadName:      "test-deployment",
+		WorkloadNamespace: "default",
+		WorkloadType:      "Deployment",
+		MinReplicas:       1,
+		MaxReplicas:       5,
+		TargetCPU:         70,
+	}
+
+	first, err := ac.CreateAutoscaler(req)
+	assert.NoError(t, err)
+
+	for i := 0; i < 2; i++ {
+		again, err := ac.CreateAutoscaler(req)
+		assert.NoError(t, err)
+		// Same workload → same autoscaler ID returned, not a new one.
+		assert.Equal(t, first.AutoscalingID, again.AutoscalingID)
+	}
+
+	assert.Equal(t, 1, len(ac.ListAutoscalers()), "same workload must not stack autoscalers")
 }
 
 // TestGetMetrics tests metrics collection
