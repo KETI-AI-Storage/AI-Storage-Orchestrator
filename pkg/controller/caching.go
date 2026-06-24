@@ -462,48 +462,22 @@ func (cc *CachingController) collectStats(job *CacheJob) {
 	}
 }
 
-// updateCacheStats updates cache statistics (simulated)
-func (cc *CachingController) updateCacheStats(job *CacheJob) {
-	cc.cachesMux.Lock()
-	defer cc.cachesMux.Unlock()
-
-	if job.Details.Stats == nil {
-		return
-	}
-
-	// Simulate statistics (in real implementation, get from Manta)
-	job.Details.Stats.TotalRequests += int64(100 + time.Now().Unix()%50)
-	job.Details.Stats.CacheHits += int64(80 + time.Now().Unix()%40)
-	job.Details.Stats.CacheMisses = job.Details.Stats.TotalRequests - job.Details.Stats.CacheHits
-
-	if job.Details.Stats.TotalRequests > 0 {
-		job.Details.Stats.HitRatio = float64(job.Details.Stats.CacheHits) / float64(job.Details.Stats.TotalRequests)
-	}
-
-	// Simulate I/O statistics based on tier
-	switch job.Request.TargetTier {
-	case types.TierNVMe:
-		job.Details.Stats.ReadThroughputMBps = 3000 + int64(time.Now().Unix()%500)
-		job.Details.Stats.WriteThroughputMBps = 2000 + int64(time.Now().Unix()%300)
-		job.Details.Stats.IOPS = 500000 + int64(time.Now().Unix()%100000)
-		job.Details.Stats.AvgReadLatencyUs = 50 + int64(time.Now().Unix()%20)
-		job.Details.Stats.AvgWriteLatencyUs = 80 + int64(time.Now().Unix()%30)
-	case types.TierSSD:
-		job.Details.Stats.ReadThroughputMBps = 500 + int64(time.Now().Unix()%100)
-		job.Details.Stats.WriteThroughputMBps = 400 + int64(time.Now().Unix()%80)
-		job.Details.Stats.IOPS = 100000 + int64(time.Now().Unix()%20000)
-		job.Details.Stats.AvgReadLatencyUs = 200 + int64(time.Now().Unix()%50)
-		job.Details.Stats.AvgWriteLatencyUs = 300 + int64(time.Now().Unix()%80)
-	case types.TierHDD:
-		job.Details.Stats.ReadThroughputMBps = 150 + int64(time.Now().Unix()%30)
-		job.Details.Stats.WriteThroughputMBps = 100 + int64(time.Now().Unix()%20)
-		job.Details.Stats.IOPS = 200 + int64(time.Now().Unix()%50)
-		job.Details.Stats.AvgReadLatencyUs = 5000 + int64(time.Now().Unix()%1000)
-		job.Details.Stats.AvgWriteLatencyUs = 8000 + int64(time.Now().Unix()%2000)
-	}
-
-	now := time.Now()
-	job.Details.Stats.LastAccessTime = &now
+// updateCacheStats refreshes cache statistics from the data-plane telemetry
+// source. This is the polling integration point driven by collectStats (30s).
+//
+// HONESTY: there is currently NO telemetry source. The Gluesys/Manta
+// gluesys.Integration interface exposes only hint/report methods (PrepareDataset,
+// ReportDatasetUsage, …) and no stats read-back, so hit ratio, throughput, IOPS
+// and latency are left UNMEASURED rather than fabricated. Previously these were
+// synthesized from wall-clock time (time.Now().Unix()%N), producing
+// realistic-looking but entirely invented numbers — the same anti-pattern the
+// migration savings path was already cleaned of (see CLAUDE.md: never report
+// fabricated metrics; report unmeasured instead).
+//
+// When a real data-plane stats API is added, read it here (under cachesMux) and
+// populate job.Details.Stats from the measured values.
+func (cc *CachingController) updateCacheStats(_ *CacheJob) {
+	// No telemetry source available — intentionally do not fabricate statistics.
 }
 
 // performEviction performs cache eviction
