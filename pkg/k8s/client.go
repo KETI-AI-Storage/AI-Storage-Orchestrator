@@ -318,8 +318,45 @@ func (c *Client) DeletePod(ctx context.Context, namespace, name string) error {
 	})
 }
 
+// migrationManagedVolumes are volume (and matching mount) names owned by the
+// migration pipeline. They are stripped from the inherited spec before fresh
+// ones are attached, so re-migrating a pod that is itself a previous migration
+// product does not produce a duplicate volume (which makes the pod invalid).
+var migrationManagedVolumes = map[string]bool{
+	"checkpoint-volume":       true,
+	"migration-stage-scratch": true,
+}
+
+func withoutManagedVolumes(vols []corev1.Volume) []corev1.Volume {
+	out := vols[:0:0]
+	for _, v := range vols {
+		if !migrationManagedVolumes[v.Name] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func withoutManagedMounts(mounts []corev1.VolumeMount) []corev1.VolumeMount {
+	out := mounts[:0:0]
+	for _, m := range mounts {
+		if !migrationManagedVolumes[m.Name] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // CreateOptimizedPod creates a new pod with only running containers.
 func (c *Client) CreateOptimizedPod(ctx context.Context, originalPod *corev1.Pod, targetNode string, containerStates []types.ContainerState, checkpointPVC string, stageMountPath string) (*corev1.Pod, error) {
+	newPod := buildOptimizedPodSpec(originalPod, targetNode, containerStates, checkpointPVC, stageMountPath)
+	return c.clientset.CoreV1().Pods(newPod.Namespace).Create(ctx, newPod, metav1.CreateOptions{})
+}
+
+// buildOptimizedPodSpec constructs the optimized (migrated) pod spec from the
+// original pod: it keeps only the containers that should migrate and attaches a
+// fresh checkpoint volume. Pure (no API calls) so it can be unit-tested.
+func buildOptimizedPodSpec(originalPod *corev1.Pod, targetNode string, containerStates []types.ContainerState, checkpointPVC string, stageMountPath string) *corev1.Pod {
 	// Create new pod spec based on original but optimized
 	newPod := originalPod.DeepCopy()
 
@@ -356,6 +393,9 @@ func (c *Client) CreateOptimizedPod(ctx context.Context, originalPod *corev1.Pod
 	for _, container := range newPod.Spec.Containers {
 		for _, state := range containerStates {
 			if container.Name == state.Name && state.ShouldMigrate {
+				// Drop any migration-managed mounts inherited from a prior
+				// migration so the add-mount logic below adds exactly one.
+				container.VolumeMounts = withoutManagedMounts(container.VolumeMounts)
 				hasMountPath := func(path string) bool {
 					for _, vm := range container.VolumeMounts {
 						if vm.MountPath == path {
@@ -398,6 +438,11 @@ func (c *Client) CreateOptimizedPod(ctx context.Context, originalPod *corev1.Pod
 
 	newPod.Spec.Containers = optimizedContainers
 
+	// Drop migration-managed volumes inherited from a prior migration (they
+	// reference a stale checkpoint PVC) so the fresh ones below don't collide
+	// by name -> spec.volumes Duplicate value.
+	newPod.Spec.Volumes = withoutManagedVolumes(newPod.Spec.Volumes)
+
 	// Add checkpoint volume if specified
 	if checkpointPVC != "" {
 		newPod.Spec.Volumes = append(newPod.Spec.Volumes, corev1.Volume{
@@ -417,7 +462,7 @@ func (c *Client) CreateOptimizedPod(ctx context.Context, originalPod *corev1.Pod
 		})
 	}
 
-	return c.clientset.CoreV1().Pods(newPod.Namespace).Create(ctx, newPod, metav1.CreateOptions{})
+	return newPod
 }
 
 // GetPodMetrics retrieves CPU and memory metrics for a pod
