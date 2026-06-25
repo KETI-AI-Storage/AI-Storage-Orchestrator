@@ -20,6 +20,13 @@ import (
 	"github.com/google/uuid"
 )
 
+// defaultCacheRoot is the orchestrator-local directory under which warmup copies
+// cached data. It is the orchestrator pod's own (ephemeral) scratch space — NOT
+// the tiered cache substrate, which lives in CSI-backed PVCs managed by the
+// storage backend. Kept in one place so warmup (writer) and eviction (reaper)
+// agree, and so tests can redirect it to a temp dir.
+const defaultCacheRoot = "/tmp/ai-storage-cache"
+
 // CachingController manages global caching for AI workloads
 // 글로벌 캐싱 컨트롤러: Manta 스토리지 티어 간 데이터 캐싱 관리
 type CachingController struct {
@@ -28,6 +35,13 @@ type CachingController struct {
 	caches        map[string]*CacheJob
 	cachesMux     sync.RWMutex
 	metrics       *types.CachingMetrics
+	// cacheRoot is the orchestrator-local warmup cache root (see defaultCacheRoot).
+	cacheRoot string
+}
+
+// cacheDir returns the orchestrator-local warmup directory for a cache job.
+func (cc *CachingController) cacheDir(jobID string) string {
+	return filepath.Join(cc.cacheRoot, jobID)
 }
 
 // CacheJob represents an active cache
@@ -48,6 +62,7 @@ func NewCachingController(k8sClient K8sClientInterface, gluesysClient gluesys.In
 		k8sClient:     k8sClient,
 		gluesysClient: gluesysClient,
 		caches:        make(map[string]*CacheJob),
+		cacheRoot:     defaultCacheRoot,
 		metrics: &types.CachingMetrics{
 			TotalCaches:  0,
 			ActiveCaches: 0,
@@ -480,20 +495,41 @@ func (cc *CachingController) updateCacheStats(_ *CacheJob) {
 	// No telemetry source available — intentionally do not fabricate statistics.
 }
 
-// performEviction performs cache eviction
+// performEviction evicts a cache. It does the one piece of data-plane work the
+// orchestrator legitimately owns — reclaiming the orchestrator-local warmup copy
+// (see defaultCacheRoot) — and delegates eviction of the tiered (CSI-backed) cache
+// to the storage backend via ReleaseDatasetHint.
+//
+// HONESTY: EvictedDataBytes is credited only with bytes we ACTUALLY freed locally,
+// never with the accounted CacheSizeBytes (which may not be locally resident). If
+// there is no local copy, freed is 0 — we do not fabricate an eviction figure. The
+// real tiered-store reclamation is the backend's responsibility and is not measured
+// here. (Previously this slept 1s and claimed it evicted CacheSizeBytes without
+// freeing anything — the same fabrication anti-pattern as the cache-stats fix.)
 func (cc *CachingController) performEviction(job *CacheJob) {
 	log.Printf("Cache %s: Starting eviction", job.ID)
 
-	// Simulate eviction process
 	select {
 	case <-job.ctx.Done():
 		return
-	case <-time.After(1 * time.Second):
+	default:
+	}
+
+	// Reclaim the orchestrator-local warmup directory (the only data this
+	// controller wrote locally). Credit only what we truly freed.
+	dir := cc.cacheDir(job.ID)
+	var freed int64
+	if _, err := os.Stat(dir); err == nil {
+		freed = dirSize(dir)
+		if rmErr := os.RemoveAll(dir); rmErr != nil {
+			cc.markJobFailed(job, fmt.Sprintf("eviction: remove local cache %q: %v", dir, rmErr))
+			return
+		}
 	}
 
 	cc.cachesMux.Lock()
 	if job.Details.Stats != nil {
-		job.Details.Stats.EvictedDataBytes += job.Details.CacheSizeBytes
+		job.Details.Stats.EvictedDataBytes += freed
 	}
 	job.Details.CacheSizeBytes = 0
 	job.Status = types.CachingStatusInactive
@@ -504,18 +540,29 @@ func (cc *CachingController) performEviction(job *CacheJob) {
 	}
 	cc.cachesMux.Unlock()
 
-	log.Printf("Cache %s: Eviction completed", job.ID)
+	// Best-effort: ask the storage backend to evict the tiered copy.
+	cc.sendReleaseHint(job)
+
+	log.Printf("Cache %s: Eviction complete (freed %d bytes of orchestrator-local warmup cache; tiered-store eviction delegated to backend)", job.ID, freed)
 }
 
-// performTierMigration migrates cache data between tiers
+// performTierMigration records a cache's tier-preference change and notifies the
+// storage backend. The orchestrator does NOT relocate data across physical tiers
+// itself — with a CSI-backed tiered store that is the storage backend's job; the
+// local tier accounting (tier counts + Details.TargetTier) was already applied
+// synchronously in MigrateTier.
+//
+// HONESTY: no *Bytes counter is touched here — no bytes were moved by us, so
+// reporting any would be fabrication. The cross-tier data movement is delegated to
+// the backend (and is not measured here). (Previously this slept 3s and logged
+// "Tier migration completed" as if a move had happened.)
 func (cc *CachingController) performTierMigration(job *CacheJob, oldTier, newTier types.StorageTier) {
-	log.Printf("Cache %s: Migrating from %s to %s", job.ID, oldTier, newTier)
+	log.Printf("Cache %s: recording tier preference %s -> %s (data movement delegated to storage backend)", job.ID, oldTier, newTier)
 
-	// Simulate migration process
 	select {
 	case <-job.ctx.Done():
 		return
-	case <-time.After(3 * time.Second):
+	default:
 	}
 
 	cc.cachesMux.Lock()
@@ -523,14 +570,17 @@ func (cc *CachingController) performTierMigration(job *CacheJob, oldTier, newTie
 	job.Details.UpdatedAt = &now
 	cc.cachesMux.Unlock()
 
-	log.Printf("Cache %s: Tier migration completed (%s -> %s)", job.ID, oldTier, newTier)
+	// Best-effort: notify the backend of the new tier preference.
+	cc.sendTierChangeHint(job, oldTier, newTier)
+
+	log.Printf("Cache %s: tier preference recorded (%s -> %s); cross-tier data movement delegated to storage backend (not measured here)", job.ID, oldTier, newTier)
 }
 
 // performWarmup pre-loads data into cache (paths는 실제 경로만; glob pattern 미사용).
 func (cc *CachingController) performWarmup(job *CacheJob, paths []string) error {
 	log.Printf("Cache %s: Starting warmup (paths: %v)", job.ID, paths)
 
-	targetRoot := filepath.Join("/tmp/ai-storage-cache", job.ID)
+	targetRoot := cc.cacheDir(job.ID)
 	if err := os.MkdirAll(targetRoot, 0o755); err != nil {
 		return fmt.Errorf("warmup mkdir %q: %w", targetRoot, err)
 	}
@@ -855,4 +905,45 @@ func (cc *CachingController) notifyMantaReportDatasetUsage(job *CacheJob) {
 			log.Printf("gluesys ReportDatasetUsage error (cache %s): %v", job.ID, err)
 		}
 	}()
+}
+
+// sendReleaseHint synchronously sends a best-effort ReleaseDatasetHint to the
+// storage backend (the real owner of tiered-cache eviction). It is called from the
+// already-background performEviction goroutine, so a synchronous call here keeps
+// the eviction result deterministic without blocking any request handler.
+func (cc *CachingController) sendReleaseHint(job *CacheJob) {
+	if cc.gluesysClient == nil {
+		return
+	}
+	dctx := cc.buildDatasetContext(job)
+	if dctx.DatasetName == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := cc.gluesysClient.ReleaseDatasetHint(ctx, dctx); err != nil {
+		log.Printf("gluesys ReleaseDatasetHint error (cache %s): %v", job.ID, err)
+	}
+}
+
+// sendTierChangeHint synchronously notifies the storage backend of a cache's new
+// tier preference. The Integration interface has no tier-specific verb, so we reuse
+// ReportDatasetUsage with an explicit note: the actual cross-tier data movement is
+// the backend's responsibility (not performed/measured by the orchestrator). Called
+// from the already-background performTierMigration goroutine.
+func (cc *CachingController) sendTierChangeHint(job *CacheJob, oldTier, newTier types.StorageTier) {
+	if cc.gluesysClient == nil {
+		return
+	}
+	dctx := cc.buildDatasetContext(job)
+	if dctx.DatasetName == "" {
+		return
+	}
+	usage := cc.buildDatasetUsage(job)
+	usage.Note = fmt.Sprintf("tier preference changed %s -> %s; cross-tier data movement is the storage backend's responsibility (not performed/measured by orchestrator)", oldTier, newTier)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := cc.gluesysClient.ReportDatasetUsage(ctx, dctx, usage); err != nil {
+		log.Printf("gluesys ReportDatasetUsage error (cache %s): %v", job.ID, err)
+	}
 }
